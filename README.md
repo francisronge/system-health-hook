@@ -3,6 +3,32 @@
 A small reference spec and collector for giving coding agents local machine context
 before and after work.
 
+## Why This Exists
+
+Coding agents often do not inspect the health of the machine they are working on
+unless the user explicitly says something feels wrong. That is backwards: agents
+clone repos, spawn browsers, start dev servers, run tests, create worktrees, and
+write caches. They should have basic local system context before and after they
+do that work.
+
+Two real incidents motivated this project:
+
+- On a MacBook Air, the internal SSD was already around 97% full. An agent cloned
+  a temporary Parallax checkout anyway, pushing disk usage to about 99%.
+- During an agent evaluation run, a headless Chrome profile was left running for
+  about three hours. Codex missed it until prompted; one renderer was consuming
+  roughly a full CPU core.
+
+These are exactly the kinds of issues system-health-aware agents should notice:
+low disk before creating large artifacts, browser automation left behind after a
+task, helper processes burning CPU, stale dev servers, runaway logs, or network
+load affecting other people on the same connection.
+
+The goal is not to make agents timid. Poor system health should not automatically
+stop work. The goal is to give the agent enough context to work intelligently,
+avoid unnecessary crashes or lag, and clean up safe, clearly-owned leftovers
+after itself.
+
 The hook is intentionally boring:
 
 - read-only
