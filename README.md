@@ -1,17 +1,16 @@
 # System Health Hook
 
-A small reference spec and collector for giving coding agents local machine context
-before and after work.
+A small macOS-first collector that gives Codex and other coding agents a quick
+read on the machine before they start work and after they finish.
 
 ## Why This Exists
 
-Coding agents often do not inspect the health of the machine they are working on
-unless the user explicitly says something feels wrong. That is backwards: agents
-clone repos, spawn browsers, start dev servers, run tests, create worktrees, and
-write caches. They should have basic local system context before and after they
-do that work.
+Agents are good at jumping into code, but they usually do not look at the
+computer they are running on unless you tell them something feels off. That is
+how you end up with big clones on nearly-full disks, forgotten browser profiles,
+stale dev servers, and helper processes eating CPU in the background.
 
-Two real incidents motivated this project:
+Two real things that happened:
 
 - On a MacBook Air, the internal SSD was already around 97% full. An agent cloned
   a temporary Parallax checkout anyway, pushing disk usage to about 99%.
@@ -19,15 +18,16 @@ Two real incidents motivated this project:
   about three hours. Codex missed it until prompted; one renderer was consuming
   roughly a full CPU core.
 
-These are exactly the kinds of issues system-health-aware agents should notice:
-low disk before creating large artifacts, browser automation left behind after a
-task, helper processes burning CPU, stale dev servers, runaway logs, or network
-load affecting other people on the same connection.
+That is the problem this hook is for. Before an agent clones a repo, runs a
+build, opens a browser, or starts a server, it should have a quick local
+snapshot. When it finishes, it should notice obvious leftovers it owns and clean
+them up safely.
 
-This is not meant to make agents timid, or make them refuse work just because
-the machine is under pressure. If the work can be done, they should still do it.
-The hook is a reminder layer: know the machine you are running on, avoid adding
-pointless churn, and clean up safe, clearly-owned leftovers when the work is done.
+This is not meant to make agents timid, or make them refuse work just because the
+machine is under pressure. If the work can be done, they should still do it. The
+hook is a reminder layer: know the machine you are running on, avoid adding
+pointless churn, and clean up safe, clearly-owned leftovers when the work is
+done.
 
 The hook is intentionally boring:
 
@@ -40,8 +40,8 @@ The hook is intentionally boring:
 - no file deletion
 - no task blocking
 
-The agent receives the telemetry, interprets it, investigates further when relevant,
-and cleans up only resources it can safely attribute to its own work.
+The hook only reports facts. The agent decides what those facts mean, investigates
+more if needed, and only cleans up resources it can clearly tie to its own work.
 
 ## Shape
 
@@ -71,8 +71,8 @@ Telemetry domains:
 - GPU / Display / Media
 - System State
 
-The hook can run at turn start and turn end. The reference script is stateless; a
-runtime may add turn deltas if it already tracks them.
+The hook can run at turn start and turn end. The reference script is stateless.
+A runtime that already tracks turns can add deltas.
 
 ## Reference Collector
 
