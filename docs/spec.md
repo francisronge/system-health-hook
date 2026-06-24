@@ -123,6 +123,9 @@ reported as `unknown`, not omitted.
 ### Browser / UI Automation State
 
 - browser automation helper processes
+- profile-backed browser processes
+- orphaned browser automation roots
+- remote debugging port processes
 - stuck browser drivers
 - screen capture/computer-use helper state
 

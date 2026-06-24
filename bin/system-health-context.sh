@@ -170,6 +170,31 @@ runtime_processes() {
     head -c 500
 }
 
+browser_profile_processes() {
+  safe_cmd ps -axo pid,ppid,etime,pcpu,pmem,command |
+    awk '/--user-data-dir=|remote-debugging-port|chromedriver|playwright/ {
+      cmd=$0
+      gsub(/--user-data-dir=[^ ]+/, "--user-data-dir=<profile>", cmd)
+      printf "pid=%s ppid=%s age=%s cpu=%s mem=%s %s; ", $1, $2, $3, $4, $5, substr(cmd, index(cmd, $6), 140)
+    }' |
+    head -c 700
+}
+
+browser_profile_process_count() {
+  safe_cmd ps -axo command |
+    awk '/--user-data-dir=|remote-debugging-port|chromedriver|playwright/ { n++ } END { print n+0 }'
+}
+
+orphaned_browser_process_count() {
+  safe_cmd ps -axo pid,ppid,command |
+    awk '$2 == 1 && /--user-data-dir=|remote-debugging-port|chromedriver|playwright/ { n++ } END { print n+0 }'
+}
+
+browser_debug_port_count() {
+  safe_cmd ps -axo command |
+    awk '/remote-debugging-port/ { n++ } END { print n+0 }'
+}
+
 system_state() {
   local up
   up="$(safe_cmd uptime | sed 's/^[[:space:]]*//')"
@@ -258,6 +283,10 @@ kv "git_status_summary" "$(if have git && git rev-parse --is-inside-work-tree >/
 
 section "Browser / UI Automation State"
 kv "browser_helper_count" "$(process_count_matching 'Chrome Helper|chromedriver|playwright|WebKit|SkyComputerUse')"
+kv "browser_profile_process_count" "$(browser_profile_process_count)"
+kv "orphaned_browser_profile_process_count" "$(orphaned_browser_process_count)"
+kv "browser_debug_port_process_count" "$(browser_debug_port_count)"
+kv "browser_profile_processes" "$(browser_profile_processes)"
 kv "screen_capture_related_count" "$(process_count_matching 'screencapture|ScreenCapture|ReplayKit|SkyComputerUse')"
 
 section "Logs / Diagnostics Growth"
