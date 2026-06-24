@@ -14,7 +14,7 @@ Two real things that happened for me:
 
 - On a MacBook Air, the internal SSD was already around 97% full. An agent cloned
   a temporary Parallax checkout anyway, pushing disk usage to about 99%.
-- During an agent evaluation run, a headless Chrome profile was left running for
+- During a Parallax evaluation run, a headless Chrome profile was left running for
   about three hours. Codex missed it until prompted; one renderer was consuming
   roughly a full CPU core.
 
