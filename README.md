@@ -24,10 +24,10 @@ low disk before creating large artifacts, browser automation left behind after a
 task, helper processes burning CPU, stale dev servers, runaway logs, or network
 load affecting other people on the same connection.
 
-The goal is not to make agents timid. Poor system health should not automatically
-stop work. The goal is to give the agent enough context to work intelligently,
-avoid unnecessary crashes or lag, and clean up safe, clearly-owned leftovers
-after itself.
+This is not meant to make agents timid, or make them refuse work just because
+the machine is under pressure. If the work can be done, they should still do it.
+The hook is a reminder layer: know the machine you are running on, avoid adding
+pointless churn, and clean up safe, clearly-owned leftovers when the work is done.
 
 The hook is intentionally boring:
 
