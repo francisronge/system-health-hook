@@ -97,10 +97,68 @@ gateway_ip() {
   route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }'
 }
 
+interface_kind() {
+  local iface="$1"
+  if have networksetup; then
+    safe_cmd networksetup -listallhardwareports |
+      awk -v iface="$iface" '
+        /^Hardware Port:/ { port=substr($0, index($0, ":") + 2) }
+        /^Device:/ && $2 == iface { print port; found=1; exit }
+        END { if (!found) print "unknown" }'
+  else
+    unknown
+  fi
+}
+
+interface_status() {
+  local iface="$1"
+  safe_cmd ifconfig "$iface" |
+    awk '
+      /status:/ { status=$2 }
+      /inet / { inet=$2 }
+      /media:/ {
+        media=$0
+        sub(/^[[:space:]]*media:[[:space:]]*/, "", media)
+      }
+      END {
+        printf "status=%s inet=%s media=%s",
+          status ? status : "unknown",
+          inet ? "present" : "absent",
+          media ? media : "unknown"
+      }'
+}
+
+wifi_association() {
+  local iface="$1"
+  if have networksetup; then
+    safe_cmd networksetup -getairportnetwork "$iface" |
+      awk '
+        /Current Wi-Fi Network:/ { print "yes"; found=1; exit }
+        /not associated/ { print "no"; found=1; exit }
+        END { if (!found) print "unknown" }'
+  else
+    unknown
+  fi
+}
+
+wifi_profiler_status() {
+  printf "not_collected_default_fast_path"
+}
+
 wifi_summary() {
+  local iface="${1:-$(active_interface)}"
+  local kind
+  kind="$(interface_kind "$iface")"
+  local status
+  status="$(interface_status "$iface")"
+  local associated
+  associated="$(wifi_association "$iface")"
+  local profiler
+  profiler="$(wifi_profiler_status)"
   local airport="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+  local radio
   if [ -x "$airport" ]; then
-    safe_cmd "$airport" -I |
+    radio="$(safe_cmd "$airport" -I |
       awk '
         /agrCtlRSSI:/ { rssi=$2 }
         /agrCtlNoise:/ { noise=$2 }
@@ -110,10 +168,12 @@ wifi_summary() {
           if (rssi || noise || tx || chan) {
             printf "rssi=%s noise=%s txRate=%s channel=%s", rssi, noise, tx, chan
           }
-        }'
+        }')"
   else
-    unknown
+    radio="rssi=unknown noise=unknown txRate=unknown channel=unknown"
   fi
+  printf "interface=%s kind=%s %s associated=%s profiler_status=%s %s" \
+    "${iface:-unknown}" "${kind:-unknown}" "${status:-unknown}" "${associated:-unknown}" "${profiler:-unknown}" "${radio:-unknown}"
 }
 
 ping_summary() {
@@ -172,7 +232,7 @@ runtime_processes() {
 
 browser_profile_processes() {
   safe_cmd ps -axo pid,ppid,etime,pcpu,pmem,command |
-    awk '/--user-data-dir=|remote-debugging-port|chromedriver|playwright/ {
+    awk '($0 ~ /--user-data-dir=/ || $0 ~ /--remote-debugging-port=/ || $0 ~ /(^|[\/ ])chromedriver([ ]|$)/ || $0 ~ /(^|[\/ ])playwright([ ]|$)/) && $0 !~ /system-health-context|awk .*user-data-dir|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ {
       cmd=$0
       gsub(/--user-data-dir=[^ ]+/, "--user-data-dir=<profile>", cmd)
       printf "pid=%s ppid=%s age=%s cpu=%s mem=%s %s; ", $1, $2, $3, $4, $5, substr(cmd, index(cmd, $6), 140)
@@ -182,17 +242,17 @@ browser_profile_processes() {
 
 browser_profile_process_count() {
   safe_cmd ps -axo command |
-    awk '/--user-data-dir=|remote-debugging-port|chromedriver|playwright/ { n++ } END { print n+0 }'
+    awk '($0 ~ /--user-data-dir=/ || $0 ~ /--remote-debugging-port=/ || $0 ~ /(^|[\/ ])chromedriver([ ]|$)/ || $0 ~ /(^|[\/ ])playwright([ ]|$)/) && $0 !~ /system-health-context|awk .*user-data-dir|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ { n++ } END { print n+0 }'
 }
 
 orphaned_browser_process_count() {
   safe_cmd ps -axo pid,ppid,command |
-    awk '$2 == 1 && /--user-data-dir=|remote-debugging-port|chromedriver|playwright/ { n++ } END { print n+0 }'
+    awk '$2 == 1 && ($0 ~ /--user-data-dir=/ || $0 ~ /--remote-debugging-port=/ || $0 ~ /(^|[\/ ])chromedriver([ ]|$)/ || $0 ~ /(^|[\/ ])playwright([ ]|$)/) && $0 !~ /system-health-context|awk .*user-data-dir|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ { n++ } END { print n+0 }'
 }
 
 browser_debug_port_count() {
   safe_cmd ps -axo command |
-    awk '/remote-debugging-port/ { n++ } END { print n+0 }'
+    awk '/--remote-debugging-port=/ && $0 !~ /system-health-context|awk .*remote-debugging-port|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ { n++ } END { print n+0 }'
 }
 
 system_state() {
@@ -209,7 +269,7 @@ printf "At turn end, clean up only safe, clearly-owned resources.\n"
 printf "Ask before destructive cleanup.\n"
 
 section "Header"
-kv "hook_version" "0.1.0"
+kv "hook_version" "0.1.1"
 kv "mode" "$MODE"
 kv "timestamp" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || unknown)"
 kv "host" "$(hostname 2>/dev/null || unknown)"

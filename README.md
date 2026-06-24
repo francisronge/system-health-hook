@@ -84,6 +84,24 @@ bin/system-health-context.sh turn_end
 The collector targets macOS first and degrades fields to `unknown` when a command
 is unavailable or too expensive.
 
+## Codex Hook Example
+
+Install the collector somewhere stable, then register it as a command-backed
+prompt hook so the agent receives the system health context:
+
+```toml
+[hooks]
+UserPromptSubmit = [
+  { prompt = { command = "/path/to/system-health-codex-hook.zsh", args = ["turn_start"], timeout = 5, statusMessage = "Collecting system health context" } }
+]
+Stop = [
+  { command = "/path/to/system-health-codex-hook.zsh", args = ["turn_end"], timeout = 8, statusMessage = "Collecting end-of-turn system health" }
+]
+```
+
+The wrapper should exit successfully even when individual probes fail, and may
+write the latest collected context to disk for debugging.
+
 ## License
 
 MIT
