@@ -10,7 +10,7 @@ computer they are running on unless you tell them something feels off. That is
 how you end up with big clones on nearly-full disks, forgotten browser profiles,
 stale dev servers, and helper processes eating CPU in the background.
 
-Two real things that happened:
+Two real things that happened for me:
 
 - On a MacBook Air, the internal SSD was already around 97% full. An agent cloned
   a temporary Parallax checkout anyway, pushing disk usage to about 99%.
@@ -84,7 +84,36 @@ bin/system-health-context.sh turn_end
 The collector targets macOS first and degrades fields to `unknown` when a command
 is unavailable or too expensive.
 
-## Codex Hook Example
+## Install For Codex
+
+Clone the repo, then run the installer:
+
+```sh
+git clone https://github.com/francisronge/system-health-hook.git
+cd system-health-hook
+./scripts/install-codex-hook.sh
+```
+
+The installer copies the hook to:
+
+```text
+~/.codex/hooks/system-health-context/
+```
+
+If `~/.codex/config.toml` does not already have a `[hooks]` section, the installer
+adds the Codex config for you and creates a timestamped backup. If you already
+have hooks, it installs the files and prints the small config block to merge.
+
+Codex may ask you to review new or changed hooks. That is expected. Review the
+path and trust it if it points to the hook you just installed.
+
+To check the hook directly:
+
+```sh
+~/.codex/hooks/system-health-context/system-health-codex-hook.zsh turn_start
+```
+
+## Manual Codex Config
 
 Install the collector somewhere stable, then register it as a command-backed
 prompt hook so the agent receives the system health context:
