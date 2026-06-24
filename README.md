@@ -105,7 +105,8 @@ adds the Codex config for you and creates a timestamped backup. If you already
 have hooks, it installs the files and prints the small config block to merge.
 
 Codex may ask you to review new or changed hooks. That is expected. Review the
-path and trust it if it points to the hook you just installed.
+path and trust it if it points to the hook you just installed. After that, the
+Hooks page should show entries for `userPromptSubmit` and `stop`.
 
 To check the hook directly:
 
@@ -115,16 +116,16 @@ To check the hook directly:
 
 ## Manual Codex Config
 
-Install the collector somewhere stable, then register it as a command-backed
-prompt hook so the agent receives the system health context:
+Install the collector somewhere stable, then register it as a command hook on
+`UserPromptSubmit` so the agent receives the system health context:
 
 ```toml
 [hooks]
 UserPromptSubmit = [
-  { prompt = { command = "/path/to/system-health-codex-hook.zsh", args = ["turn_start"], timeout = 5, statusMessage = "Collecting system health context" } }
+  { hooks = [ { type = "command", command = "/path/to/system-health-codex-hook.zsh turn_start", timeout = 5, statusMessage = "Collecting system health context" } ] }
 ]
 Stop = [
-  { command = "/path/to/system-health-codex-hook.zsh", args = ["turn_end"], timeout = 8, statusMessage = "Collecting end-of-turn system health" }
+  { hooks = [ { type = "command", command = "/path/to/system-health-codex-hook.zsh turn_end", timeout = 8, statusMessage = "Collecting end-of-turn system health" } ] }
 ]
 ```
 

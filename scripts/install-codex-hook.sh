@@ -7,6 +7,10 @@ install_dir="${SYSTEM_HEALTH_HOOK_INSTALL_DIR:-$codex_home/hooks/system-health-c
 config="${CODEX_CONFIG:-$codex_home/config.toml}"
 wrapper="$install_dir/system-health-codex-hook.zsh"
 
+toml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 mkdir -p "$install_dir" "$(dirname "$config")"
 cp "$repo_root/bin/system-health-context.sh" "$install_dir/system-health-context.sh"
 cp "$repo_root/bin/system-health-codex-hook.zsh" "$wrapper"
@@ -16,23 +20,26 @@ if [[ ! -f "$config" ]]; then
   : > "$config"
 fi
 
+turn_start_command="$(toml_escape "\"$wrapper\" turn_start")"
+turn_end_command="$(toml_escape "\"$wrapper\" turn_end")"
+
 snippet="$(cat <<EOF
 [hooks]
 UserPromptSubmit = [
-  { prompt = { command = "$wrapper", args = ["turn_start"], timeout = 5, statusMessage = "Collecting system health context" } }
+  { hooks = [ { type = "command", command = "$turn_start_command", timeout = 5, statusMessage = "Collecting system health context" } ] }
 ]
 Stop = [
-  { command = "$wrapper", args = ["turn_end"], timeout = 8, statusMessage = "Collecting end-of-turn system health" }
+  { hooks = [ { type = "command", command = "$turn_end_command", timeout = 8, statusMessage = "Collecting end-of-turn system health" } ] }
 ]
 EOF
 )"
 
 hook_entries="$(cat <<EOF
 UserPromptSubmit = [
-  { prompt = { command = "$wrapper", args = ["turn_start"], timeout = 5, statusMessage = "Collecting system health context" } }
+  { hooks = [ { type = "command", command = "$turn_start_command", timeout = 5, statusMessage = "Collecting system health context" } ] }
 ]
 Stop = [
-  { command = "$wrapper", args = ["turn_end"], timeout = 8, statusMessage = "Collecting end-of-turn system health" }
+  { hooks = [ { type = "command", command = "$turn_end_command", timeout = 8, statusMessage = "Collecting end-of-turn system health" } ] }
 ]
 EOF
 )"
