@@ -34,11 +34,11 @@ A few real things that happened for me:
 
 This is not just my machine being weird. Theo talked about the same macOS process
 security-check problem on Nerd Snipe at
-[30:04](https://www.youtube.com/watch?v=qfSgN9i5Fd4&t=1804s). There was
+[28:41-29:47](https://www.youtube.com/watch?v=qfSgN9i5Fd4&t=1721s). There was
 also a viral report of a Codex bug hammering SSD writes:
 [x.com/hqmank/status/2069020259097735231](https://x.com/hqmank/status/2069020259097735231?s=46).
 
-[![Nerd Snipe clip about macOS process security checks](https://img.youtube.com/vi/qfSgN9i5Fd4/hqdefault.jpg)](https://www.youtube.com/watch?v=qfSgN9i5Fd4&t=1804s)
+[![Nerd Snipe clip about macOS process security checks](https://img.youtube.com/vi/qfSgN9i5Fd4/hqdefault.jpg)](https://www.youtube.com/watch?v=qfSgN9i5Fd4&t=1721s)
 
 That is the problem this hook is for. Before an agent clones a repo, runs a build,
 opens a browser, starts a server, or spawns a pile of helpers, it should have a
