@@ -1,7 +1,9 @@
 # System Health Hook
 
-A small macOS-first collector that gives Codex and other coding agents a quick
-read on the machine before they start work and after they finish.
+A tiny macOS-first system health context hook for Codex and other coding agents.
+
+It gives the agent a cheap read on the machine before it starts work and after it
+finishes, without turning the health check into another source of churn.
 
 ## Why This Exists
 
@@ -51,6 +53,50 @@ hook is a reminder layer: know the machine you are running on, avoid adding
 pointless churn, and clean up safe, clearly-owned leftovers when the work is
 done.
 
+The hook only reports facts. The agent decides what those facts mean, investigates
+more if needed, and only cleans up resources it can clearly tie to its own work.
+
+## How It Works
+
+The default collector is a native Swift CLI:
+
+```text
+Codex hook
+  -> system-health-codex-hook.zsh
+  -> system-health-context
+  -> compact system snapshot
+  -> exits
+```
+
+There is no daemon, no local server, no always-on monitor, and no automatic
+cleanup.
+
+The shell wrapper exists only to fit Codex's command-hook shape and save the
+latest output for debugging. The actual health collection is done by the native
+binary.
+
+## Safety Budget
+
+The hook itself cannot become the problem.
+
+The normal collector does not run:
+
+- `log show`
+- `spctl`
+- `codesign`
+- `du`
+- `find`
+- `lsof`
+- `system_profiler`
+- `top`
+- `ps`
+- shell pipelines
+- source/repo scans
+
+It uses bounded macOS APIs and system calls instead. If a useful signal is not
+cheap enough for the default path, it is left out. The agent can investigate
+manually when the surface snapshot shows a real reason.
+
 The hook is intentionally boring:
 
 - read-only
@@ -62,82 +108,38 @@ The hook is intentionally boring:
 - no file deletion
 - no task blocking
 
-The hook only reports facts. The agent decides what those facts mean, investigates
-more if needed, and only cleans up resources it can clearly tie to its own work.
+## Output Shape
 
-## Safety Budget
+Default text output is a compact card:
 
-The hook itself cannot become the problem.
+```text
+System Health Context
 
-Default collection is deliberately cheap. It uses lightweight process, disk,
-network, and system counters, reuses process snapshots instead of calling `ps`
-over and over, and skips probes that are known to create extra churn on macOS.
-In particular:
+Use this as cheap local machine context.
+Do not refuse work solely because of system health.
+If something looks unhealthy, investigate before adding heavier work.
+At turn end, clean up only safe, clearly-owned resources.
+Ask before destructive cleanup.
 
-- no automatic `log show`
-- no automatic Gatekeeper assessment
-- no recursive cache/worktree sizing on every prompt
-- no automatic port-owner scans
-- no process killing
-- no cleanup
-- no repo scans
-
-Security logs and Gatekeeper checks are opt-in only:
-
-```sh
-SYSTEM_HEALTH_SECURITY_DEEP=1 bin/system-health-context.sh turn_start
+Header: hook_version=0.2.0 mode=turn_start timestamp=... host=...
+Storage: disk=10% free=1789G workspace=>79.6MB
+CPU: load=3.73/3.15/2.79 top=Codex:3.2%, spotlightknowledged:2.3%, Codex:0.3%
+Security: syspolicyd=0.0% trustd=0.0% sandboxd=0.0%
+Memory: free=30.8G swap=0.0G top=Codex:5.4%, Google Chrome:2.4%, Codex:1.3%
+Power: source=AC battery=100% charging=not_charging low_power=off thermal=nominal
+Network: interface=en0 gateway=192.168.1.1 gateway_tcp=3.3ms wan_tcp=7.8ms
+WiFi: interface=en0 associated=yes rssi=-53dBm noise=-96dBm channel=36 tx=1080Mbps
+Codex: processes=27 helpers=13 app_servers=1 mcp=10 mcp_max_age=1h38m node_repl=2 node_repl_max_age=1h38m computer_use=5 computer_use_max_age=1h38m xcodebuildmcp=4 xcodebuildmcp_max_age=1h38m
+Lifecycle: processes=426 zombies=0
+BrowserAutomation: profiles=13 orphaned=0 debug_ports=0
+Collection: 149ms
 ```
 
-Expensive sizing is opt-in too:
+JSON is available for tests and integrations:
 
 ```sh
-SYSTEM_HEALTH_DEEP=1 bin/system-health-context.sh turn_end
+.build/debug/system-health-context --json turn_start
 ```
-
-The normal path should tell the agent enough to be aware without making
-`syspolicyd`, `trustd`, Spotlight, disk I/O, or the Codex UI do more work just to
-learn that the machine is already struggling.
-
-## Shape
-
-The hook emits:
-
-- a short agent instruction
-- collection metadata
-- fixed local system telemetry sections
-
-Telemetry domains:
-
-- Storage
-- I/O Pressure
-- CPU
-- Memory
-- Power
-- Network
-- Codex State
-- Process Lifecycle
-- Resource Limits
-- OS Security / Permissions
-- Runtime / Tooling
-- Workspace Hygiene
-- Browser / UI Automation State
-- Logs / Diagnostics Growth
-- Sync / Backup / Indexing
-- GPU / Display / Media
-- System State
-
-The hook can run at turn start and turn end. The reference script is stateless.
-A runtime that already tracks turns can add deltas.
-
-## Reference Collector
-
-```sh
-bin/system-health-context.sh turn_start
-bin/system-health-context.sh turn_end
-```
-
-The collector targets macOS first and degrades fields to `unknown` when a command
-is unavailable or too expensive.
 
 ## Install For Codex
 
@@ -149,21 +151,29 @@ cd system-health-hook
 ./scripts/install-codex-hook.sh
 ```
 
-The installer copies the hook to:
+The installer builds the native Swift binary and copies the hook to:
 
 ```text
 ~/.codex/hooks/system-health-context/
+```
+
+Installed files:
+
+```text
+system-health-context           native collector
+system-health-codex-hook.zsh    Codex wrapper
+system-health-context.sh        legacy fallback collector
 ```
 
 If `~/.codex/config.toml` does not already have a `[hooks]` section, the installer
 adds the Codex config for you and creates a timestamped backup. If you already
 have hooks, it installs the files and prints the small config block to merge.
 
-Codex may ask you to review new or changed hooks. That is expected. Review the
-path and trust it if it points to the hook you just installed. After that, the
-Hooks page should show entries for `userPromptSubmit` and `stop`.
+Codex may ask you to review new or changed hooks. Review the path and trust it if
+it points to the hook you just installed. After that, the Hooks page should show
+entries for `UserPromptSubmit` and `Stop`.
 
-To check the hook directly:
+To check the installed hook directly:
 
 ```sh
 ~/.codex/hooks/system-health-context/system-health-codex-hook.zsh turn_start
@@ -171,8 +181,7 @@ To check the hook directly:
 
 ## Manual Codex Config
 
-Install the collector somewhere stable, then register it as a command hook on
-`UserPromptSubmit` so the agent receives the system health context:
+Install the collector somewhere stable, then register it as a command hook:
 
 ```toml
 [hooks]
@@ -184,8 +193,22 @@ Stop = [
 ]
 ```
 
-The wrapper should exit successfully even when individual probes fail, and may
-write the latest collected context to disk for debugging.
+The wrapper exits successfully even when individual signals are unavailable.
+
+## Development
+
+Build:
+
+```sh
+swift build --product system-health-context
+```
+
+Run:
+
+```sh
+.build/debug/system-health-context turn_start
+.build/debug/system-health-context --json turn_start
+```
 
 ## License
 

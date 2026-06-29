@@ -6,15 +6,26 @@ codex_home="${CODEX_HOME:-$HOME/.codex}"
 install_dir="${SYSTEM_HEALTH_HOOK_INSTALL_DIR:-$codex_home/hooks/system-health-context}"
 config="${CODEX_CONFIG:-$codex_home/config.toml}"
 wrapper="$install_dir/system-health-codex-hook.zsh"
+binary="$repo_root/.build/release/system-health-context"
 
 toml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 mkdir -p "$install_dir" "$(dirname "$config")"
+
+if ! command -v swift >/dev/null 2>&1; then
+  echo "Swift toolchain not found. Install Xcode Command Line Tools, then rerun this installer." >&2
+  exit 1
+fi
+
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$repo_root/.build/clang-module-cache}"
+swift build --disable-sandbox -c release --product system-health-context --package-path "$repo_root"
+
+cp "$binary" "$install_dir/system-health-context"
 cp "$repo_root/bin/system-health-context.sh" "$install_dir/system-health-context.sh"
 cp "$repo_root/bin/system-health-codex-hook.zsh" "$wrapper"
-chmod 755 "$install_dir/system-health-context.sh" "$wrapper"
+chmod 755 "$install_dir/system-health-context" "$install_dir/system-health-context.sh" "$wrapper"
 
 if [[ ! -f "$config" ]]; then
   : > "$config"
@@ -66,6 +77,7 @@ fi
 
 echo
 echo "Hook files:"
+echo "  $install_dir/system-health-context"
 echo "  $install_dir/system-health-context.sh"
 echo "  $wrapper"
 echo
