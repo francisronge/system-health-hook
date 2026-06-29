@@ -161,7 +161,6 @@ Installed files:
 ```text
 system-health-context           native collector
 system-health-codex-hook.zsh    Codex wrapper
-system-health-context.sh        legacy fallback collector
 ```
 
 If `~/.codex/config.toml` does not already have a `[hooks]` section, the installer

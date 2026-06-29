@@ -5,7 +5,6 @@ mode="${1:-turn_start}"
 script_path="${0:A}"
 base="${script_path:h}"
 collector="$base/system-health-context"
-legacy_collector="$base/system-health-context.sh"
 latest_dir="${SYSTEM_HEALTH_HOOK_LATEST_DIR:-$base/latest}"
 mkdir -p "$latest_dir"
 
@@ -20,8 +19,6 @@ out="$latest_dir/${mode}.txt"
 
 if [[ -x "$collector" ]]; then
   "$collector" "$mode" > "$tmp" 2> "$err"
-elif [[ -x "$legacy_collector" ]]; then
-  "$legacy_collector" "$mode" > "$tmp" 2> "$err"
 else
   {
     echo "System Health Context"

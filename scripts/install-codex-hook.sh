@@ -23,9 +23,8 @@ export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$repo_root/.build/cla
 swift build --disable-sandbox -c release --product system-health-context --package-path "$repo_root"
 
 cp "$binary" "$install_dir/system-health-context"
-cp "$repo_root/bin/system-health-context.sh" "$install_dir/system-health-context.sh"
 cp "$repo_root/bin/system-health-codex-hook.zsh" "$wrapper"
-chmod 755 "$install_dir/system-health-context" "$install_dir/system-health-context.sh" "$wrapper"
+chmod 755 "$install_dir/system-health-context" "$wrapper"
 
 if [[ ! -f "$config" ]]; then
   : > "$config"
@@ -78,7 +77,6 @@ fi
 echo
 echo "Hook files:"
 echo "  $install_dir/system-health-context"
-echo "  $install_dir/system-health-context.sh"
 echo "  $wrapper"
 echo
 echo "Smoke test:"
