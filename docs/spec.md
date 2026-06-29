@@ -42,6 +42,8 @@ integrations.
 
 For Codex, install this on `UserPromptSubmit`. Do not register the plaintext
 collector as a `Stop` hook; Codex treats `Stop` as a JSON control hook.
+The wrapper still returns no-op JSON for `turn_end` so old cached Stop hook
+registrations do not show errors.
 
 ## Probe Budget
 

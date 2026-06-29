@@ -11,6 +11,11 @@ case "$mode" in
   *) mode="turn_start" ;;
 esac
 
+if [[ "$mode" == "turn_end" ]]; then
+  printf '{"suppressOutput":true}\n'
+  exit 0
+fi
+
 if [[ -x "$collector" ]]; then
   if [[ -n "${SYSTEM_HEALTH_HOOK_LATEST_DIR:-}" ]]; then
     latest_dir="${SYSTEM_HEALTH_HOOK_LATEST_DIR}"
