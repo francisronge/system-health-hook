@@ -38,6 +38,8 @@ security-check problem on Nerd Snipe at
 also a viral report of a Codex bug hammering SSD writes:
 [x.com/hqmank/status/2069020259097735231](https://x.com/hqmank/status/2069020259097735231?s=46).
 
+[![Nerd Snipe clip about macOS process security checks](https://img.youtube.com/vi/qfSgN9i5Fd4/hqdefault.jpg)](https://www.youtube.com/watch?v=qfSgN9i5Fd4&t=1804s)
+
 That is the problem this hook is for. Before an agent clones a repo, runs a build,
 opens a browser, starts a server, or spawns a pile of helpers, it should have a
 quick local snapshot. When it finishes, it should notice obvious leftovers it
