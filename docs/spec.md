@@ -24,8 +24,7 @@ The default collector is one native Swift executable:
 system-health-context
 ```
 
-The Codex wrapper calls that binary, prints its output, writes the latest output
-for debugging, and exits.
+The Codex wrapper calls that binary, prints its output, and exits.
 
 There is no daemon, local server, background cache, or always-on monitor.
 

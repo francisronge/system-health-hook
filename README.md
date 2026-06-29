@@ -70,9 +70,8 @@ Codex hook
 There is no daemon, no local server, no always-on monitor, and no automatic
 cleanup.
 
-The shell wrapper exists only to fit Codex's command-hook shape and save the
-latest output for debugging. The actual health collection is done by the native
-binary.
+The shell wrapper exists only to fit Codex's command-hook shape. The actual
+health collection is done by the native binary.
 
 ## Safety Budget
 
