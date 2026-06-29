@@ -14,10 +14,32 @@ Give an agent current local machine context before and after work.
 - It does not kill processes.
 - It does not change system settings.
 
+## Probe Budget
+
+The hook must not create the system-health problem it is trying to expose.
+
+Default probes should be cheap, bounded, and read-only. Expensive probes should
+be opt-in, time-bounded, and clearly marked in the output when skipped.
+Collectors should reuse already-collected local snapshots where possible instead
+of spawning the same system tools repeatedly.
+
+Default collection should not run:
+
+- `log show`
+- Gatekeeper assessment
+- recursive cache/worktree sizing
+- port-owner scans
+- source/repo scans
+
+Security daemon activity should be visible by cheap process stats first. Deep
+security log sampling is for explicit debugging, not every prompt.
+
 ## Run Points
 
 - `turn_start`: fast local snapshot before planning.
 - `turn_end`: local snapshot after work. Runtimes may add turn deltas if already available.
+  A turn-end hook should still stay on the cheap path unless deep mode is
+  explicitly enabled.
 
 ## Agent Payload
 

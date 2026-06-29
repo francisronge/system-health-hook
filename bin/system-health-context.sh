@@ -4,9 +4,12 @@ set -u
 MODE="${1:-turn_start}"
 START_NS="$(date +%s 2>/dev/null || echo 0)"
 DEEP=0
-if [ "$MODE" = "turn_end" ]; then
+if [ "${SYSTEM_HEALTH_DEEP:-0}" = "1" ]; then
+  DEEP=1
+elif [ "$MODE" = "turn_end" ] && [ "${SYSTEM_HEALTH_TURN_END_DEEP:-0}" = "1" ]; then
   DEEP=1
 fi
+DU_TIMEOUT_SECONDS="${SYSTEM_HEALTH_DU_TIMEOUT_SECONDS:-3}"
 
 unknown() {
   printf "unknown"
@@ -32,6 +35,49 @@ safe_cmd() {
   "$@" 2>/dev/null || true
 }
 
+bounded_cmd() {
+  local timeout="$1"
+  shift
+  perl -e '
+    use strict;
+    use warnings;
+    use POSIX ":sys_wait_h";
+    my ($timeout, @cmd) = @ARGV;
+    pipe(my $reader, my $writer) or exit 1;
+    my $pid = fork();
+    exit 1 unless defined $pid;
+    if ($pid == 0) {
+      close $reader;
+      open STDOUT, ">&", $writer or exit 1;
+      open STDERR, ">", "/dev/null";
+      exec @cmd;
+      exit 127;
+    }
+    close $writer;
+    my $timed_out = 0;
+    local $SIG{ALRM} = sub {
+      $timed_out = 1;
+      kill "TERM", $pid;
+    };
+    alarm($timeout);
+    while (my $line = <$reader>) {
+      print $line;
+    }
+    alarm(0);
+    if ($timed_out) {
+      select undef, undef, undef, 0.2;
+      kill "KILL", $pid if waitpid($pid, WNOHANG) == 0;
+    }
+    waitpid($pid, 0);
+  ' "$timeout" "$@" 2>/dev/null || true
+}
+
+sanitize_log_snippet() {
+  sed "s#$HOME#~#g" |
+    sed -E 's#https?://[^[:space:]]+#<url>#g; s#[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+#<email>#g; s#[[:space:]]+# #g' |
+    cut -c 1-220
+}
+
 bytes_to_gb() {
   awk 'BEGIN { printf "%.1f GB", ARGV[1] / 1024 / 1024 }' "$1"
 }
@@ -39,10 +85,65 @@ bytes_to_gb() {
 du_mb() {
   local path="$1"
   if [ -e "$path" ]; then
-    safe_cmd du -sk "$path" | awk '{ printf "%.1f MB", $1 / 1024 }'
+    perl -MPOSIX=:sys_wait_h -e '
+      my ($timeout, $path) = @ARGV;
+      pipe(my $reader, my $writer) or exit 1;
+      my $pid = fork();
+      exit 1 unless defined $pid;
+      if ($pid == 0) {
+        close $reader;
+        open STDOUT, ">&", $writer or exit 1;
+        open STDERR, ">", "/dev/null";
+        exec "du", "-sk", $path;
+        exit 127;
+      }
+      close $writer;
+      my $timed_out = 0;
+      local $SIG{ALRM} = sub {
+        $timed_out = 1;
+        kill "TERM", $pid;
+      };
+      alarm($timeout);
+      my $line = <$reader> // "";
+      alarm(0);
+      if ($timed_out) {
+        select undef, undef, undef, 0.2;
+        kill "KILL", $pid if waitpid($pid, WNOHANG) == 0;
+        waitpid($pid, 0);
+        print "not_collected_bounded_path";
+        exit 0;
+      }
+      waitpid($pid, 0);
+      if ($line =~ /^(\d+)/) {
+        printf "%.1f MB", $1 / 1024;
+      } else {
+        print "unknown";
+      }
+    ' "$DU_TIMEOUT_SECONDS" "$path" 2>/dev/null || printf "unknown"
   else
     printf "absent"
   fi
+}
+
+git_worktree_size_signal() {
+  local path="$1"
+  local top
+  if ! have git; then
+    return 1
+  fi
+  top="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -z "$top" ] || [ "$top" != "$path" ]; then
+    return 1
+  fi
+  local tracked
+  local dirty
+  tracked="$(git -C "$path" ls-files 2>/dev/null | wc -l | tr -d ' ')"
+  dirty="$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  printf "git_worktree_signal tracked_files=%s dirty=%s" "${tracked:-unknown}" "${dirty:-unknown}"
+}
+
+workspace_size_signal() {
+  git_worktree_size_signal "$1" || du_mb "$1"
 }
 
 du_mb_deep() {
@@ -55,7 +156,7 @@ du_mb_deep() {
 
 top_processes() {
   local sort_key="$1"
-  safe_cmd ps -axo pid,ppid,pcpu,pmem,comm |
+  printf "%s\n" "${PS_COMM:-}" |
     awk 'NR == 1 { next } { print }' |
     sort -k "$sort_key" -nr |
     head -5 |
@@ -64,7 +165,11 @@ top_processes() {
 
 process_count_matching() {
   local pattern="$1"
-  safe_cmd pgrep -fi "$pattern" | wc -l | tr -d ' '
+  printf "%s\n" "${PS_COMMAND:-}" |
+    awk -v pat="$pattern" '
+      BEGIN { pat=tolower(pat) }
+      NR > 1 && tolower($0) ~ pat { n++ }
+      END { print n+0 }'
 }
 
 listening_ports() {
@@ -80,12 +185,18 @@ listening_ports() {
 listening_ports_compact() {
   if [ "$DEEP" -eq 1 ]; then
     listening_ports
-  elif have lsof; then
-    local count
-    count="$(safe_cmd lsof -nP -iTCP -sTCP:LISTEN | awk 'NR > 1 { n++ } END { print n+0 }')"
-    printf "count=%s details=not_collected_turn_start_fast_path" "${count:-unknown}"
   else
-    unknown
+    printf "details=not_collected_default_fast_path"
+  fi
+}
+
+listening_socket_count() {
+  if have netstat; then
+    safe_cmd netstat -an -p tcp | awk '/LISTEN/ { n++ } END { print n+0 }'
+  elif [ "$DEEP" -eq 1 ] && have lsof; then
+    safe_cmd lsof -nP -iTCP -sTCP:LISTEN | awk 'NR > 1 { n++ } END { print n+0 }'
+  else
+    printf "unknown"
   fi
 }
 
@@ -201,7 +312,15 @@ memory_pressure_summary() {
 }
 
 thermal_pressure() {
-  printf "not_collected_default_fast_path"
+  if have pmset; then
+    local therm
+    therm="$(bounded_cmd 1 pmset -g therm 2>/dev/null | tr '\n' '; ' | sed 's/[; ]*$//')"
+    if [ -n "$therm" ]; then
+      printf "%s" "$therm"
+      return
+    fi
+  fi
+  printf "unavailable_fast_probe"
 }
 
 power_summary() {
@@ -221,17 +340,72 @@ low_power_mode() {
 }
 
 security_counts() {
-  printf "not_collected_default_fast_path"
+  if ! have log; then
+    printf "log_unavailable"
+    return
+  fi
+
+  local max_cpu
+  max_cpu="$(printf "%s\n" "${PS_COMMAND:-}" |
+    awk '/syspolicyd|trustd|sandboxd/ && $0 !~ /system-health-context|awk .*syspolicyd/ {
+      if ($4 + 0 > max) max = $4 + 0
+    } END { printf "%.1f", max + 0 }')"
+  if [ "${SYSTEM_HEALTH_SECURITY_DEEP:-0}" != "1" ]; then
+    printf "skipped=deep_log_sampling_opt_in_only max_cpu=%s set_SYSTEM_HEALTH_SECURITY_DEEP=1_to_force" "${max_cpu:-0.0}"
+    return
+  fi
+
+  local window="${SYSTEM_HEALTH_SECURITY_WINDOW:-2m}"
+  local raw
+  raw="$(bounded_cmd 2 log show --style compact --last "$window" --predicate 'process == "syspolicyd" OR process == "sandboxd" OR eventMessage CONTAINS[c] "AppleSystemPolicy" OR eventMessage CONTAINS[c] "Sandbox:" OR eventMessage CONTAINS[c] "deny(" OR eventMessage CONTAINS[c] "denied" OR eventMessage CONTAINS[c] "not allowed" OR eventMessage CONTAINS[c] "operation not permitted"')"
+
+  if [ -z "$raw" ]; then
+    printf "window=%s lines=0 deny_like=0" "$window"
+    return
+  fi
+
+  local lines deny_like syspolicyd_lines trustd_lines sandboxd_lines first_line last_line
+  lines="$(printf "%s\n" "$raw" | awk 'NF { n++ } END { print n+0 }')"
+  deny_like="$(printf "%s\n" "$raw" | awk '{ line=tolower($0) } line ~ /sandbox:|applesystempolicy|deny\(|denied|not allowed|operation not permitted/ { n++ } END { print n+0 }')"
+  syspolicyd_lines="$(printf "%s\n" "$raw" | awk '/syspolicyd/ { n++ } END { print n+0 }')"
+  trustd_lines="$(printf "%s\n" "$raw" | awk '/trustd/ { n++ } END { print n+0 }')"
+  sandboxd_lines="$(printf "%s\n" "$raw" | awk '/sandboxd/ { n++ } END { print n+0 }')"
+  first_line="$(printf "%s\n" "$raw" | awk '{ folded=tolower($0) } NF && $0 !~ /^Timestamp/ && folded ~ /sandbox:|applesystempolicy|deny\(|denied|not allowed|operation not permitted|syspolicyd|sandboxd/ { print; exit }' | sanitize_log_snippet)"
+  last_line="$(printf "%s\n" "$raw" | awk '{ folded=tolower($0) } NF && $0 !~ /^Timestamp/ && folded ~ /sandbox:|applesystempolicy|deny\(|denied|not allowed|operation not permitted|syspolicyd|sandboxd/ { line=$0 } END { print line }' | sanitize_log_snippet)"
+
+  printf "window=%s trigger=max_security_daemon_cpu:%s lines=%s deny_like=%s syspolicyd_lines=%s trustd_lines=%s sandboxd_lines=%s first=%s last=%s" \
+    "$window" "${max_cpu:-unknown}" "$lines" "$deny_like" "$syspolicyd_lines" "$trustd_lines" "$sandboxd_lines" "${first_line:-none}" "${last_line:-none}"
+}
+
+security_daemon_cpu_summary() {
+  printf "%s\n" "${PS_COMMAND:-}" |
+    awk '
+      /syspolicyd|trustd|sandboxd/ && $0 !~ /system-health-context|awk .*syspolicyd/ {
+        cmd=$0
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+[0-9.]+[[:space:]]+[0-9.]+[[:space:]]+/, "", cmd)
+        name=cmd
+        sub(/^.*\//, "", name)
+        sub(/[[:space:]].*$/, "", name)
+        printf "%s:%s=%s; ", $1, name, $4
+      }'
+}
+
+codex_gatekeeper_status() {
+  if [ "${SYSTEM_HEALTH_SECURITY_DEEP:-0}" != "1" ]; then
+    printf "skipped=deep_security_opt_in_only"
+    return
+  fi
+  safe_cmd spctl --assess --type execute /Applications/Codex.app && printf accepted || printf unknown
 }
 
 runtime_processes() {
-  safe_cmd ps -axo pid,ppid,pcpu,pmem,comm |
+  printf "%s\n" "${PS_COMM:-}" |
     awk '/node|python|xcodebuild|swift|npm|pnpm|yarn|vite|webpack|wrangler|docker|orb/ { printf "%s:%s cpu=%s mem=%s; ", $1, $5, $3, $4 }' |
     head -c 500
 }
 
 browser_profile_processes() {
-  safe_cmd ps -axo pid,ppid,etime,pcpu,pmem,command |
+  printf "%s\n" "${PS_COMMAND:-}" |
     awk '($0 ~ /--user-data-dir=/ || $0 ~ /--remote-debugging-port=/ || $0 ~ /(^|[\/ ])chromedriver([ ]|$)/ || $0 ~ /(^|[\/ ])playwright([ ]|$)/) && $0 !~ /system-health-context|awk .*user-data-dir|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ {
       cmd=$0
       gsub(/--user-data-dir=[^ ]+/, "--user-data-dir=<profile>", cmd)
@@ -241,18 +415,42 @@ browser_profile_processes() {
 }
 
 browser_profile_process_count() {
-  safe_cmd ps -axo command |
+  printf "%s\n" "${PS_COMMAND:-}" |
     awk '($0 ~ /--user-data-dir=/ || $0 ~ /--remote-debugging-port=/ || $0 ~ /(^|[\/ ])chromedriver([ ]|$)/ || $0 ~ /(^|[\/ ])playwright([ ]|$)/) && $0 !~ /system-health-context|awk .*user-data-dir|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ { n++ } END { print n+0 }'
 }
 
 orphaned_browser_process_count() {
-  safe_cmd ps -axo pid,ppid,command |
+  printf "%s\n" "${PS_COMMAND:-}" |
     awk '$2 == 1 && ($0 ~ /--user-data-dir=/ || $0 ~ /--remote-debugging-port=/ || $0 ~ /(^|[\/ ])chromedriver([ ]|$)/ || $0 ~ /(^|[\/ ])playwright([ ]|$)/) && $0 !~ /system-health-context|awk .*user-data-dir|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ { n++ } END { print n+0 }'
 }
 
 browser_debug_port_count() {
-  safe_cmd ps -axo command |
+  printf "%s\n" "${PS_COMMAND:-}" |
     awk '/--remote-debugging-port=/ && $0 !~ /system-health-context|awk .*remote-debugging-port|SkyComputerUseClient|codex-notify-wrapper|agent-turn-complete/ { n++ } END { print n+0 }'
+}
+
+process_count_total() {
+  printf "%s\n" "${PS_COMM:-}" | awk 'NR > 1 { n++ } END { print n+0 }'
+}
+
+zombie_process_count() {
+  printf "%s\n" "${PS_STAT:-}" | awk 'NR > 1 && /Z/ { n++ } END { print n+0 }'
+}
+
+long_running_codex_helpers() {
+  printf "%s\n" "${PS_COMMAND:-}" |
+    awk '/Codex|codex|node_repl|SkyComputerUseClient/ {
+      cmd=$0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+[0-9.]+[[:space:]]+[0-9.]+[[:space:]]+/, "", cmd)
+      printf "%s pid=%s %s; ", $3, $1, substr(cmd, 1, 120)
+    }' |
+    head -c 500
+}
+
+gpu_renderer_processes() {
+  printf "%s\n" "${PS_COMM:-}" |
+    awk '/GPU|Renderer|WindowServer|VTEncoder|VTDecoder|audio|camera/ { printf "%s:%s cpu=%s mem=%s; ", $1, $5, $3, $4 }' |
+    head -c 500
 }
 
 system_state() {
@@ -260,6 +458,10 @@ system_state() {
   up="$(safe_cmd uptime | sed 's/^[[:space:]]*//')"
   printf "%s" "${up:-unknown}"
 }
+
+PS_COMM="$(safe_cmd ps -axo pid,ppid,pcpu,pmem,comm)"
+PS_COMMAND="$(safe_cmd ps -axo pid,ppid,etime,pcpu,pmem,command)"
+PS_STAT="$(safe_cmd ps -axo stat)"
 
 printf "System Health Context\n\n"
 printf "Use this telemetry as local system context.\n"
@@ -269,14 +471,16 @@ printf "At turn end, clean up only safe, clearly-owned resources.\n"
 printf "Ask before destructive cleanup.\n"
 
 section "Header"
-kv "hook_version" "0.1.1"
+kv "hook_version" "0.1.3"
 kv "mode" "$MODE"
 kv "timestamp" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || unknown)"
 kv "host" "$(hostname 2>/dev/null || unknown)"
 
+WORKSPACE_SIZE="$(workspace_size_signal "${PWD}")"
+
 section "Storage"
 kv "internal_disk" "$(safe_cmd df -H "$HOME" | awk 'NR == 2 { printf "used=%s free=%s mount=%s", $5, $4, $NF }')"
-kv "workspace_size" "$(du_mb "${PWD}")"
+kv "workspace_size" "$WORKSPACE_SIZE"
 kv "codex_home_size" "not_collected_default_fast_path"
 kv "slash_tmp_size" "$(du_mb_deep /tmp)"
 
@@ -287,7 +491,7 @@ section "CPU"
 kv "load_average" "$(safe_cmd uptime | awk -F'load averages?: ' '{ print $2 }')"
 kv "top_cpu_processes" "$(top_processes 3)"
 kv "codex_process_count" "$(process_count_matching 'Codex|codex')"
-kv "security_daemon_cpu" "$(safe_cmd ps -axo comm,pcpu | awk '/syspolicyd|trustd|sandboxd/ { printf "%s=%s; ", $1, $2 }')"
+kv "security_daemon_cpu" "$(security_daemon_cpu_summary)"
 kv "thermal_pressure" "$(thermal_pressure)"
 
 section "Memory"
@@ -316,18 +520,18 @@ kv "codex_automations_dir" "$(du_mb "${CODEX_HOME:-$HOME/.codex}/automations")"
 kv "listening_ports" "$(listening_ports_compact)"
 
 section "Process Lifecycle"
-kv "process_count" "$(safe_cmd ps -axo pid | wc -l | tr -d ' ')"
-kv "zombie_processes" "$(safe_cmd ps -axo stat | awk '/Z/ { n++ } END { print n+0 }')"
-kv "long_running_codex_helpers" "$(safe_cmd ps -axo etime,pid,comm | awk '/Codex|codex|node_repl|SkyComputerUseClient/ { printf "%s pid=%s %s; ", $1, $2, $3 }' | head -c 500)"
+kv "process_count" "$(process_count_total)"
+kv "zombie_processes" "$(zombie_process_count)"
+kv "long_running_codex_helpers" "$(long_running_codex_helpers)"
 
 section "Resource Limits"
 kv "open_file_limit" "$(ulimit -n 2>/dev/null || unknown)"
 kv "process_limit" "$(ulimit -u 2>/dev/null || unknown)"
-kv "listening_socket_count" "$(if have lsof; then safe_cmd lsof -nP -iTCP -sTCP:LISTEN | awk 'NR > 1 { n++ } END { print n+0 }'; else unknown; fi)"
+kv "listening_socket_count" "$(listening_socket_count)"
 
 section "OS Security / Permissions"
 kv "recent_security_denial_lines" "$(security_counts)"
-kv "codex_gatekeeper" "$(safe_cmd spctl --assess --type execute /Applications/Codex.app && printf accepted || printf unknown)"
+kv "codex_gatekeeper" "$(codex_gatekeeper_status)"
 
 section "Runtime / Tooling"
 kv "runtime_processes" "$(runtime_processes)"
@@ -336,7 +540,7 @@ kv "homebrew_cache_size" "$(du_mb_deep "$HOME/Library/Caches/Homebrew")"
 
 section "Workspace Hygiene"
 kv "cwd" "$PWD"
-kv "cwd_size" "$(du_mb "$PWD")"
+kv "cwd_size" "$WORKSPACE_SIZE"
 kv "codex_worktrees_count" "$(if [ -d "${CODEX_HOME:-$HOME/.codex}/worktrees" ]; then find "${CODEX_HOME:-$HOME/.codex}/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '; else printf "0"; fi)"
 kv "codex_worktrees_size" "not_collected_default_bounded_path"
 kv "git_status_summary" "$(if have git && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git status --porcelain 2>/dev/null | awk '{ n++ } END { print "porcelain_lines=" n+0 }'; else printf "not_git"; fi)"
@@ -360,7 +564,7 @@ kv "backup_process_count" "$(process_count_matching 'backupd|TimeMachine')"
 kv "cloud_sync_process_count" "$(process_count_matching 'bird|cloudd|fileproviderd')"
 
 section "GPU / Display / Media"
-kv "gpu_renderer_processes" "$(safe_cmd ps -axo pid,pcpu,pmem,comm | awk '/GPU|Renderer|WindowServer|VTEncoder|VTDecoder|audio|camera/ { printf "%s:%s cpu=%s mem=%s; ", $1, $4, $2, $3 }' | head -c 500)"
+kv "gpu_renderer_processes" "$(gpu_renderer_processes)"
 
 section "System State"
 kv "uptime" "$(system_state)"
