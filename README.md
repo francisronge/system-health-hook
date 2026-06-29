@@ -11,8 +11,8 @@ Agents are good at jumping into code, but they usually do not look at the
 computer they are running on unless you tell them something feels off.
 
 That is insane to me. These tools can change your life, and Codex is still my
-favorite tool ever, but it should not take the user yelling that the fan is
-going crazy before the agent notices the machine is under pressure.
+favorite tool ever, but I do not want to find out the machine is choking only
+after the fan starts screaming.
 
 That is how you end up with big clones on nearly-full disks, forgotten browser
 profiles, stale dev servers, security daemons melting the CPU, and helper
@@ -49,9 +49,8 @@ owns and clean them up safely.
 
 This is not meant to make agents timid, or make them refuse work just because the
 machine is under pressure. If the work can be done, they should still do it. The
-hook is a reminder layer: know the machine you are running on, avoid adding
-pointless churn, and clean up safe, clearly-owned leftovers when the work is
-done.
+hook is just context: let the agent see the machine, avoid obvious waste, and
+clean up safe stuff it clearly owns when the work is done.
 
 The hook only reports facts. The agent decides what those facts mean, investigates
 more if needed, and only cleans up resources it can clearly tie to its own work.
