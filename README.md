@@ -168,7 +168,7 @@ have hooks, it installs the files and prints the small config block to merge.
 
 Codex may ask you to review new or changed hooks. Review the path and trust it if
 it points to the hook you just installed. After that, the Hooks page should show
-entries for `UserPromptSubmit` and `Stop`.
+an entry for `UserPromptSubmit`.
 
 To check the installed hook directly:
 
@@ -184,9 +184,6 @@ Install the collector somewhere stable, then register it as a command hook:
 [hooks]
 UserPromptSubmit = [
   { hooks = [ { type = "command", command = "/path/to/system-health-codex-hook.zsh turn_start", timeout = 5, statusMessage = "Collecting system health context" } ] }
-]
-Stop = [
-  { hooks = [ { type = "command", command = "/path/to/system-health-codex-hook.zsh turn_end", timeout = 8, statusMessage = "Collecting end-of-turn system health" } ] }
 ]
 ```
 

@@ -40,6 +40,9 @@ system-health-context --version
 The text format is for agent context. The JSON format is for tests and other
 integrations.
 
+For Codex, install this on `UserPromptSubmit`. Do not register the plaintext
+collector as a `Stop` hook; Codex treats `Stop` as a JSON control hook.
+
 ## Probe Budget
 
 The hook must not create the system-health problem it is trying to expose.

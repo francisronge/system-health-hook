@@ -31,15 +31,11 @@ if [[ ! -f "$config" ]]; then
 fi
 
 turn_start_command="$(toml_escape "\"$wrapper\" turn_start")"
-turn_end_command="$(toml_escape "\"$wrapper\" turn_end")"
 
 snippet="$(cat <<EOF
 [hooks]
 UserPromptSubmit = [
   { hooks = [ { type = "command", command = "$turn_start_command", timeout = 5, statusMessage = "Collecting system health context" } ] }
-]
-Stop = [
-  { hooks = [ { type = "command", command = "$turn_end_command", timeout = 8, statusMessage = "Collecting end-of-turn system health" } ] }
 ]
 EOF
 )"
@@ -47,9 +43,6 @@ EOF
 hook_entries="$(cat <<EOF
 UserPromptSubmit = [
   { hooks = [ { type = "command", command = "$turn_start_command", timeout = 5, statusMessage = "Collecting system health context" } ] }
-]
-Stop = [
-  { hooks = [ { type = "command", command = "$turn_end_command", timeout = 8, statusMessage = "Collecting end-of-turn system health" } ] }
 ]
 EOF
 )"
