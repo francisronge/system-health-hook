@@ -34,7 +34,7 @@ A few real things that happened for me:
 
 This is not just my machine being weird. Theo talked about the same macOS process
 security-check problem on Nerd Snipe at
-[28:41-29:47](https://www.youtube.com/watch?v=0EvF0jAMvX0&t=1721s). There was
+[30:04](https://www.youtube.com/watch?v=qfSgN9i5Fd4&t=1804s). There was
 also a viral report of a Codex bug hammering SSD writes:
 [x.com/hqmank/status/2069020259097735231](https://x.com/hqmank/status/2069020259097735231?s=46).
 
