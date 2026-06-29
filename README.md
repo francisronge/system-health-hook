@@ -11,8 +11,8 @@ Agents are good at jumping into code, but they usually do not look at the
 computer they are running on unless you tell them something feels off.
 
 That is insane to me. These tools can change your life, and Codex is still my
-favorite tool ever, but I do not want to find out the machine is choking only
-after the fan starts screaming.
+favorite tool ever. I just do not want the fan screaming to be the first sign
+that something is wrong.
 
 That is how you end up with big clones on nearly-full disks, forgotten browser
 profiles, stale dev servers, security daemons melting the CPU, and helper
