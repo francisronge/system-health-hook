@@ -2,8 +2,9 @@
 
 A tiny macOS-first system health context hook for Codex and other coding agents.
 
-It gives the agent a cheap read on the machine before it starts work and after it
-finishes, without turning the health check into another source of churn.
+It gives the agent a cheap read on the machine before each turn and reminds it to
+clean up after the work, without turning the health check into another source of
+churn.
 
 ## Why This Exists
 
@@ -25,6 +26,10 @@ A few real things that happened for me:
 - During a Parallax evaluation run, a headless Chrome profile was left running for
   about three hours. Codex missed it until prompted; one renderer was consuming
   roughly a full CPU core.
+- Codex browser tooling left a persistent Node-REPL kernel running for four and a
+  half hours. It was using roughly one and a half CPU cores, had an 11 GB physical
+  footprint, and had peaked at 40 GB. The old hook reduced it to a generic
+  `ChatGPT` process and did not make the problem visible.
 - macOS can run security checks around spawned processes through `syspolicyd`,
   `trustd`, and friends. I have seen that turn into brutal CPU churn with Codex:
   an older Full Disk Access/write-access issue was bad enough to crash my M5 Pro,
@@ -73,6 +78,11 @@ cleanup.
 The shell wrapper exists only to fit Codex's command-hook shape. The actual
 health collection is done by the native binary.
 
+The collector combines a 100 ms live sample with durable counters already kept
+by macOS. The live sample shows what is busy now. Process age, lifetime CPU,
+physical and peak memory, disk I/O, and wakeups keep long-running tooling visible
+even when the short sample lands during a quiet moment.
+
 ## Safety Budget
 
 The hook itself cannot become the problem.
@@ -90,6 +100,7 @@ The normal collector does not run:
 - `ps`
 - shell pipelines
 - source/repo scans
+- workspace filesystem walks
 
 It uses bounded macOS APIs and system calls instead. If a useful signal is not
 cheap enough for the default path, it is left out. The agent can investigate
@@ -113,25 +124,46 @@ Default text output is a compact card:
 ```text
 System Health Context
 
-Use this as cheap local machine context.
+Treat this as operational context, not decoration.
 Do not refuse work solely because of system health.
-If something looks unhealthy, investigate before adding heavier work.
+If a signal could affect the work, investigate before adding load and adapt.
+Do not recite healthy values.
 At turn end, clean up only safe, clearly-owned resources.
 Ask before destructive cleanup.
 
-Header: hook_version=0.2.0 mode=turn_start timestamp=... host=...
-Storage: disk=10% free=1789G workspace=>79.6MB
-CPU: load=3.73/3.15/2.79 top=Codex:3.2%, spotlightknowledged:2.3%, Codex:0.3%
+Header: hook_version=0.3.0 mode=turn_start timestamp=... host=...
+Storage: disk=10% free=1789G
+CPU: cores=18 busy=8.4% load=3.73/3.15/2.79 top=node_repl[5960]:166%/4h33m
 Security: syspolicyd=0.0% trustd=0.0% sandboxd=0.0%
-Memory: free=30.8G swap=0.0G top=Codex:5.4%, Google Chrome:2.4%, Codex:1.3%
-Power: source=AC battery=100% charging=not_charging low_power=off thermal=nominal
-Network: interface=en0 gateway=192.168.1.1 gateway_tcp=3.3ms wan_tcp=7.8ms
+Memory: ram=68.7G free=9.0G inactive=31.7G compressed=3.8G wired=3.5G swap=0.4G top=node_repl[5960]:11.0G/peak=40.0G/4h33m
+Power: source=AC battery=100% charging=not_charging low_power=off thermal_pressure=nominal
+Network: interface=en0 rx=29KB/s tx=51KB/s gateway=192.168.1.1 gateway_tcp=3.3ms wan_tcp=7.8ms
 WiFi: interface=en0 associated=yes rssi=-53dBm noise=-96dBm channel=36 tx=1080Mbps
-Codex: processes=27 helpers=13 app_servers=1 mcp=10 mcp_max_age=1h38m node_repl=2 node_repl_max_age=1h38m computer_use=5 computer_use_max_age=1h38m xcodebuildmcp=4 xcodebuildmcp_max_age=1h38m
-Lifecycle: processes=426 zombies=0
-BrowserAutomation: profiles=13 orphaned=0 debug_ports=0
-Collection: 149ms
+Codex: host_processes=13 helpers=18 app_servers=2 mcp=13 mcp_max_age=6h31m node_repl=5 node_repl_max_age=5h28m computer_use=6 computer_use_max_age=6h31m xcodebuildmcp=6 xcodebuildmcp_max_age=5h28m
+CodexResources: cpu=node_repl[5960]:now=166%/avg=150%/age=4h33m memory=node_repl[5960]:11.0G/peak=40.0G io=node_repl[5960]:read_avg=1.2MB/s/total=20.0G/write_avg=123KB/s/total=2.0G
+Lifecycle: uptime=6h33m processes=484 zombies=0 orphaned_helpers=0
+BrowserAutomation: processes=12 profiles=1 orphaned=0 debug_ports=0
+Collection: 138ms
 ```
+
+`thermal_pressure=nominal` means macOS is not currently throttling the machine.
+It does not mean the laptop is cool. CPU use and process resource lines are what
+make a heat source visible before thermal throttling starts.
+
+The example values above are illustrative. The hook reports raw facts and leaves
+the investigation and response to the agent.
+
+## Performance Budget
+
+The hook remains a single short-lived process. On the machine used to develop
+version 0.3, nine release-build runs had a median collection time of 138 ms. Five
+runs of the installed hook with full macOS Wi-Fi visibility ranged from 141 to
+148 ms, with a median of 144 ms. The 0.2 release collector had a median of 147 ms
+over five comparable runs.
+
+Performance is part of correctness here. New default signals should use bounded
+native APIs, fit inside the existing sample window, and be benchmarked before
+release.
 
 JSON is available for tests and integrations:
 

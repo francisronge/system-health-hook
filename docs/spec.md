@@ -2,7 +2,8 @@
 
 ## Purpose
 
-Give an agent cheap local machine context before and after work.
+Give an agent cheap local machine context before each turn and remind it to clean
+up safe, clearly-owned resources when the work is done.
 
 The hook reports what the machine looks like. It does not decide what to do.
 
@@ -27,6 +28,10 @@ system-health-context
 The Codex wrapper calls that binary, prints its output, and exits.
 
 There is no daemon, local server, background cache, or always-on monitor.
+
+The collector uses one 100 ms live sample. Durable process counters supplement
+that sample so a long-running process remains visible when it happens to be quiet
+during the sample.
 
 ## CLI
 
@@ -64,6 +69,7 @@ Default collection must not run:
 - `ps`
 - shell pipelines
 - source/repo scans
+- workspace filesystem walks
 
 If a signal needs one of those, it does not belong in the default hook. The agent
 can investigate manually when the surface snapshot gives it a reason.
@@ -75,9 +81,10 @@ The hook output begins with this agent-facing text:
 ```text
 System Health Context
 
-Use this as cheap local machine context.
+Treat this as operational context, not decoration.
 Do not refuse work solely because of system health.
-If something looks unhealthy, investigate before adding heavier work.
+If a signal could affect the work, investigate before adding load and adapt.
+Do not recite healthy values.
 At turn end, clean up only safe, clearly-owned resources.
 Ask before destructive cleanup.
 ```
@@ -97,12 +104,31 @@ Current domains:
 - Network
 - WiFi
 - Codex
+- CodexResources
 - Lifecycle
 - BrowserAutomation
 - Collection
 
 Signals that are useful but not cheap enough for the default path should be left
 out of the card, not represented as skipped probe noise.
+
+Process output should preserve a useful type and PID without printing command
+lines. For Codex and tool helpers, the compact card may include:
+
+- current and lifetime-average CPU
+- current and peak physical footprint
+- lifetime and average disk I/O
+- average wakeups
+- process age
+
+The hook reports `thermal_pressure`, not temperature. A nominal pressure state
+means macOS is not throttling; it does not mean the machine is cool.
+
+## Performance Gate
+
+Changes to the default collector must be benchmarked as a release build. Added
+signals should fit inside the existing sample window and should not introduce a
+daemon, subprocess fan-out, unbounded enumeration, or repeated deep probes.
 
 ## Privacy
 

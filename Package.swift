@@ -18,6 +18,10 @@ let package = Package(
                 .linkedFramework("IOKit"),
                 .linkedFramework("SystemConfiguration")
             ]
+        ),
+        .testTarget(
+            name: "SystemHealthContextTests",
+            dependencies: ["SystemHealthContext"]
         )
     ]
 )
