@@ -128,23 +128,27 @@ Treat this as operational context, not decoration.
 Do not refuse work solely because of system health.
 If a signal could affect the work, investigate before adding load and adapt.
 Do not recite healthy values.
+Helpers listed may belong to other active sessions; own only what this session started.
 At turn end, clean up only safe, clearly-owned resources.
 Ask before destructive cleanup.
 
-Header: hook_version=0.3.0 mode=turn_start timestamp=... host=...
+Header: hook_version=0.4.0 mode=turn_start timestamp=... host=...
 Storage: disk=10% free=1789G
 CPU: cores=18 busy=8.4% load=3.73/3.15/2.79 top=node_repl[5960]:166%/4h33m
 Security: syspolicyd=0.0% trustd=0.0% sandboxd=0.0%
-Memory: ram=68.7G free=9.0G inactive=31.7G compressed=3.8G wired=3.5G swap=0.4G top=node_repl[5960]:11.0G/peak=40.0G/4h33m
+Memory: pressure=normal ram=68.7G free=9.0G inactive=31.7G compressed=3.8G wired=3.5G swap=0.4G top=node_repl[5960]:11.0G/peak=40.0G/4h33m
 Power: source=AC battery=100% charging=not_charging low_power=off thermal_pressure=nominal
-Network: interface=en0 rx=29KB/s tx=51KB/s gateway=192.168.1.1 gateway_tcp=3.3ms wan_tcp=7.8ms
+Network: route=en0 rx=29KB/s tx=51KB/s gateway=192.168.1.1 gateway_tcp=3.3ms wan_tcp=7.8ms
 WiFi: interface=en0 associated=yes rssi=-53dBm noise=-96dBm channel=36 tx=1080Mbps
-Codex: host_processes=13 helpers=18 app_servers=2 mcp=13 mcp_max_age=6h31m node_repl=5 node_repl_max_age=5h28m computer_use=6 computer_use_max_age=6h31m xcodebuildmcp=6 xcodebuildmcp_max_age=5h28m
+Codex: hosts=13 helpers=18 (mcp=7 node_repl=5 computer_use=2 xcodebuildmcp=4) app_servers=2 oldest=(mcp=6h31m node_repl=5h28m computer_use=2h4m xcodebuildmcp=5h28m)
 CodexResources: cpu=node_repl[5960]:now=166%/avg=150%/age=4h33m memory=node_repl[5960]:11.0G/peak=40.0G io=node_repl[5960]:read_avg=1.2MB/s/total=20.0G/write_avg=123KB/s/total=2.0G
 Lifecycle: uptime=6h33m processes=484 zombies=0 orphaned_helpers=0
 BrowserAutomation: processes=12 profiles=1 orphaned=0 debug_ports=0
 Collection: 138ms
 ```
+
+`Network` follows the kernel's default route, including a VPN tunnel. `WiFi`
+still describes the physical wireless link, so the two lines can be different.
 
 `thermal_pressure=nominal` means macOS is not currently throttling the machine.
 It does not mean the laptop is cool. CPU use and process resource lines are what
@@ -156,10 +160,9 @@ the investigation and response to the agent.
 ## Performance Budget
 
 The hook remains a single short-lived process. On the machine used to develop
-version 0.3, nine release-build runs had a median collection time of 138 ms. Five
-runs of the installed hook with full macOS Wi-Fi visibility ranged from 141 to
-148 ms, with a median of 144 ms. The 0.2 release collector had a median of 147 ms
-over five comparable runs.
+version 0.4, nine comparable runs had a median of 145 ms for the installed 0.3
+collector and 148 ms for the 0.4 release collector. The 100 ms live sample still
+accounts for most of that time.
 
 Performance is part of correctness here. New default signals should use bounded
 native APIs, fit inside the existing sample window, and be benchmarked before
@@ -227,6 +230,12 @@ Build:
 
 ```sh
 swift build --product system-health-context
+```
+
+Test with compiler warnings treated as errors:
+
+```sh
+swift test -Xswiftc -warnings-as-errors
 ```
 
 Run:

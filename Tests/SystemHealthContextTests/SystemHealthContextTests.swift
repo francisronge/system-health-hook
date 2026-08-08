@@ -1,16 +1,18 @@
+import Darwin
 import XCTest
 @testable import SystemHealthContext
 
 final class SystemHealthContextTests: XCTestCase {
     private func sample(
         pid: pid_t = 42,
+        ppid: pid_t = 1,
         name: String = "node",
         path: String = "/usr/local/bin/node",
         args: String = "node"
     ) -> ProcessSample {
         ProcessSample(
             pid: pid,
-            ppid: 1,
+            ppid: ppid,
             name: name,
             path: path,
             args: args,
@@ -37,6 +39,25 @@ final class SystemHealthContextTests: XCTestCase {
         XCTAssertEqual(processLabel(process), "node_repl[42]")
     }
 
+    func testMachTicksUseTheHostTimebaseInsteadOfAssumingNanoseconds() {
+        XCTAssertEqual(nanosecondsFromMachTicks(24, numerator: 125, denominator: 3), 1_000)
+        XCTAssertEqual(nanosecondsFromMachTicks(42, numerator: 1, denominator: 1), 42)
+    }
+
+    func testProcessArgumentsStopBeforeEnvironment() {
+        var argc: Int32 = 2
+        var buffer: [UInt8] = []
+        withUnsafeBytes(of: &argc) { buffer.append(contentsOf: $0) }
+        buffer.append(contentsOf: Array("/usr/local/bin/node".utf8) + [0, 0])
+        buffer.append(contentsOf: Array("node".utf8) + [0])
+        buffer.append(contentsOf: Array("script.js".utf8) + [0])
+        buffer.append(contentsOf: Array("SECRET_TOKEN=do-not-read".utf8) + [0])
+
+        let arguments = parsedProcessArguments(buffer)
+        XCTAssertEqual(arguments, ["node", "script.js"])
+        XCTAssertFalse(arguments.joined().contains("SECRET_TOKEN"))
+    }
+
     func testArgumentValueSupportsQuotedAndPlainValues() {
         XCTAssertEqual(argumentValue("--user-data-dir=", in: "chrome --user-data-dir=/tmp/profile --flag"), "/tmp/profile")
         XCTAssertEqual(argumentValue("--user-data-dir=", in: "chrome --user-data-dir=\"/tmp/a profile\" --flag"), "/tmp/a profile")
@@ -59,6 +80,75 @@ final class SystemHealthContextTests: XCTestCase {
         let process = sample()
         XCTAssertEqual(process.memoryBytes, 80)
         XCTAssertEqual(processMemorySummary(process), "80B/peak=120B")
+    }
+
+    func testHelperBucketsAreDisjoint() {
+        let processes = [
+            sample(pid: 1, args: "node codex-mcp-server"),
+            sample(pid: 2, args: "node xcodebuildmcp server"),
+            sample(pid: 3, args: "node /tools/node_repl/kernel.js"),
+            sample(pid: 4, args: "node computer-use helper"),
+            sample(pid: 5, args: "codex app-server")
+        ]
+
+        let buckets = helperBuckets(processes)
+        XCTAssertEqual(buckets["mcp"]?.map(\.pid), [1])
+        XCTAssertEqual(buckets["xcodebuildmcp"]?.map(\.pid), [2])
+        XCTAssertEqual(buckets["node_repl"]?.map(\.pid), [3])
+        XCTAssertEqual(buckets["computer_use"]?.map(\.pid), [4])
+        XCTAssertEqual(buckets["app_server"]?.map(\.pid), [5])
+    }
+
+    func testDefaultRouteMessageReadsInterfaceIndexAndIPv4Gateway() {
+        let headerSize = MemoryLayout<rt_msghdr>.stride
+        let addressSize = MemoryLayout<sockaddr_in>.stride
+        var header = rt_msghdr()
+        header.rtm_msglen = UInt16(headerSize + addressSize)
+        header.rtm_version = UInt8(RTM_VERSION)
+        header.rtm_index = 7
+        header.rtm_addrs = RTA_GATEWAY
+
+        var gateway = sockaddr_in()
+        gateway.sin_len = UInt8(addressSize)
+        gateway.sin_family = sa_family_t(AF_INET)
+        gateway.sin_addr = in_addr(s_addr: inet_addr("10.5.0.1"))
+
+        var bytes: [UInt8] = []
+        withUnsafeBytes(of: &header) { bytes.append(contentsOf: $0) }
+        withUnsafeBytes(of: &gateway) { bytes.append(contentsOf: $0) }
+
+        let parsed = parsedRouteMessage(bytes)
+        XCTAssertEqual(parsed?.interfaceIndex, 7)
+        XCTAssertEqual(parsed?.gateway, "10.5.0.1")
+    }
+
+    func testLifecycleUsesZombieCountCollectedBeforeTaskLookup() {
+        let line = lifecycleLine([sample(ppid: 2)], processCount: 501, zombieCount: 3)
+        XCTAssertTrue(line.contains("processes=501 zombies=3"))
+    }
+
+    func testBrowserAutomationGetsDetailedResourceUsage() {
+        XCTAssertTrue(shouldCollectDetailedUsage(
+            name: "chrome-headless-shell",
+            path: "/tmp/chrome-headless-shell",
+            args: "--user-data-dir=/tmp/profile --remote-debugging-port=9222"
+        ))
+    }
+
+    func testCodexRendererIsNotBrowserAutomationJustBecauseItHasAUserDataDirectory() {
+        let process = sample(
+            name: "Codex (Renderer)",
+            path: "/Applications/ChatGPT.app/Contents/Frameworks/Codex (Renderer)",
+            args: "--type=renderer --user-data-dir=/Users/example/Library/Application Support/Codex"
+        )
+
+        XCTAssertFalse(isBrowserAutomationProcess(process))
+        XCTAssertNil(helperKind(process))
+        XCTAssertTrue(shouldCollectDetailedUsage(
+            name: process.name,
+            path: process.path,
+            args: process.args
+        ))
     }
 
     func testRunawayNodeReplRemainsVisibleOutsideShortCPUSample() {

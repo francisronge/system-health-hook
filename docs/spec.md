@@ -85,6 +85,7 @@ Treat this as operational context, not decoration.
 Do not refuse work solely because of system health.
 If a signal could affect the work, investigate before adding load and adapt.
 Do not recite healthy values.
+Helpers listed may belong to other active sessions; own only what this session started.
 At turn end, clean up only safe, clearly-owned resources.
 Ask before destructive cleanup.
 ```
@@ -121,6 +122,12 @@ lines. For Codex and tool helpers, the compact card may include:
 - average wakeups
 - process age
 
+Helper categories must be disjoint. A process belongs to one type, so the typed
+counts add up to the reported helper total.
+
+`Network` follows the kernel's default route. `WiFi` describes the physical
+wireless interface, even when a VPN owns the route.
+
 The hook reports `thermal_pressure`, not temperature. A nominal pressure state
 means macOS is not throttling; it does not mean the machine is cool.
 
@@ -135,3 +142,5 @@ daemon, subprocess fan-out, unbounded enumeration, or repeated deep probes.
 The hook should emit system metadata, not private content. It must not print
 secrets, environment variable values, tokens, clipboard contents, document bodies,
 browser history, message contents, file contents, or process command lines.
+Process classification may inspect argv, but it must stop after `argc` entries
+and must not read the environment block returned by `KERN_PROCARGS2`.

@@ -4,7 +4,28 @@ import Foundation
 import IOKit.ps
 import SystemConfiguration
 
-let hookVersion = "0.3.0"
+let hookVersion = "0.4.0"
+
+let machTimebase: mach_timebase_info_data_t = {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return info
+}()
+
+func nanosecondsFromMachTicks(
+    _ ticks: UInt64,
+    numerator: UInt32 = machTimebase.numer,
+    denominator: UInt32 = machTimebase.denom
+) -> UInt64 {
+    guard denominator > 0 else { return ticks }
+    let divisor = UInt64(denominator)
+    let multiplier = UInt64(numerator)
+    let whole = ticks / divisor
+    let remainder = ticks % divisor
+    let (wholeNanos, overflow) = whole.multipliedReportingOverflow(by: multiplier)
+    if overflow { return UInt64.max }
+    return wholeNanos + (remainder * multiplier) / divisor
+}
 
 struct ProcessSample {
     let pid: pid_t
@@ -46,8 +67,26 @@ struct InterfaceCounters {
 
 struct ProcessSnapshot {
     let processes: [ProcessSample]
+    let processCount: Int
+    let zombieCount: Int
     let systemBusyPercent: Double?
     let interfaceRates: [String: (received: Double, sent: Double)]
+}
+
+struct ProcessCollection {
+    let samples: [ProcessSample]
+    let processCount: Int
+    let zombieCount: Int
+}
+
+struct DefaultRoute {
+    let interface: String
+    let gateway: String?
+}
+
+struct ParsedRouteMessage {
+    let interfaceIndex: UInt32
+    let gateway: String?
 }
 
 struct Snapshot {
@@ -230,6 +269,31 @@ func processPath(pid: pid_t) -> String {
     return ""
 }
 
+func parsedProcessArguments(_ buffer: [UInt8]) -> [String] {
+    let integerSize = MemoryLayout<Int32>.size
+    guard buffer.count >= integerSize else { return [] }
+
+    let argumentCount = buffer.withUnsafeBytes { rawBuffer -> Int in
+        Int(rawBuffer.loadUnaligned(as: Int32.self))
+    }
+    guard argumentCount > 0, argumentCount <= 4_096 else { return [] }
+
+    var index = integerSize
+    while index < buffer.count, buffer[index] != 0 { index += 1 }
+    while index < buffer.count, buffer[index] == 0 { index += 1 }
+
+    var arguments: [String] = []
+    arguments.reserveCapacity(argumentCount)
+    for _ in 0..<argumentCount {
+        guard index < buffer.count else { break }
+        let start = index
+        while index < buffer.count, buffer[index] != 0 { index += 1 }
+        arguments.append(String(decoding: buffer[start..<index], as: UTF8.self))
+        if index < buffer.count { index += 1 }
+    }
+    return arguments
+}
+
 func processArguments(pid: pid_t) -> String {
     var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
     var size = 0
@@ -242,10 +306,7 @@ func processArguments(pid: pid_t) -> String {
         return ""
     }
 
-    let bytes = buffer.dropFirst(MemoryLayout<Int32>.size).prefix(size - MemoryLayout<Int32>.size).map { byte in
-        byte == 0 ? UInt8(ascii: " ") : byte
-    }
-    return String(bytes: bytes, encoding: .utf8) ?? ""
+    return parsedProcessArguments(Array(buffer.prefix(size))).joined(separator: " ")
 }
 
 func bsdInfo(pid: pid_t) -> proc_bsdinfo? {
@@ -297,6 +358,8 @@ func shouldCollectDetailedUsage(name: String, path: String, args: String) -> Boo
     let details = args.lowercased()
     return name.lowercased() == "chatgpt"
         || name.lowercased() == "codex"
+        || identity.contains("/applications/chatgpt.app")
+        || identity.contains("/applications/codex.app")
         || identity.contains("node")
         || identity.contains("npm")
         || identity.contains("mcp")
@@ -308,9 +371,28 @@ func shouldCollectDetailedUsage(name: String, path: String, args: String) -> Boo
         || identity.contains("cua_node")
         || details.contains("node_repl")
         || details.contains("computer-use")
+        || isBrowserAutomationIdentity(identity: identity, arguments: details)
 }
 
-func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> [ProcessSample] {
+func isBrowserAutomationIdentity(identity: String, arguments: String) -> Bool {
+    let text = "\(identity) \(arguments)".lowercased()
+    return text.contains("--headless")
+        || text.contains("--remote-debugging-port=")
+        || text.contains("--remote-debugging-pipe")
+        || text.contains("chrome-headless-shell")
+        || text.contains("chromedriver")
+        || text.contains("playwright")
+        || text.contains("puppeteer")
+}
+
+func isBrowserAutomationProcess(_ process: ProcessSample) -> Bool {
+    isBrowserAutomationIdentity(
+        identity: "\(process.name) \(process.path)",
+        arguments: process.args
+    )
+}
+
+func listedProcessIDs() -> [pid_t] {
     let pidByteCount = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
     guard pidByteCount > 0 else { return [] }
 
@@ -320,14 +402,36 @@ func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> [Pr
         proc_listpids(UInt32(PROC_ALL_PIDS), 0, pointer.baseAddress, pidByteCount)
     }
     let count = max(0, Int(actualByteCount) / MemoryLayout<pid_t>.stride)
+    return Array(pids.prefix(count).filter { $0 > 0 })
+}
+
+func collectCPUTimes() -> [pid_t: UInt64] {
+    var times: [pid_t: UInt64] = [:]
+    for pid in listedProcessIDs() {
+        guard let task = taskInfo(pid: pid) else { continue }
+        let ticks = UInt64(task.pti_total_user) + UInt64(task.pti_total_system)
+        times[pid] = nanosecondsFromMachTicks(ticks)
+    }
+    return times
+}
+
+func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> ProcessCollection {
+    let pids = listedProcessIDs()
 
     var samples: [ProcessSample] = []
-    samples.reserveCapacity(count)
+    samples.reserveCapacity(pids.count)
+    var processCount = 0
+    var zombieCount = 0
 
-    for pid in pids.prefix(count) where pid > 0 {
-        guard let bsd = bsdInfo(pid: pid), let task = taskInfo(pid: pid) else {
+    for pid in pids {
+        guard let bsd = bsdInfo(pid: pid) else { continue }
+        processCount += 1
+        let status = Int32(bitPattern: bsd.pbi_status)
+        if status == SZOMB {
+            zombieCount += 1
             continue
         }
+        guard let task = taskInfo(pid: pid) else { continue }
         let bsdName = stringFromCCharTuple(bsd.pbi_name)
         let name = bsdName.isEmpty ? processName(pid: pid) : bsdName
         let path = processPath(pid: pid)
@@ -335,8 +439,10 @@ func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> [Pr
         let usage = includeDetailedUsage && shouldCollectDetailedUsage(name: name, path: path, args: args)
             ? resourceUsage(pid: pid)
             : nil
-        let taskCPUNanos = UInt64(task.pti_total_user) + UInt64(task.pti_total_system)
-        let usageCPUNanos = usage.map { $0.ri_user_time + $0.ri_system_time } ?? 0
+        let taskCPUTicks = UInt64(task.pti_total_user) + UInt64(task.pti_total_system)
+        let usageCPUTicks = usage.map { $0.ri_user_time + $0.ri_system_time } ?? 0
+        let taskCPUNanos = nanosecondsFromMachTicks(taskCPUTicks)
+        let usageCPUNanos = nanosecondsFromMachTicks(usageCPUTicks)
         samples.append(ProcessSample(
             pid: pid,
             ppid: pid_t(bitPattern: bsd.pbi_ppid),
@@ -352,11 +458,11 @@ func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> [Pr
             diskWriteBytes: usage?.ri_diskio_byteswritten ?? 0,
             idleWakeups: usage.map { $0.ri_pkg_idle_wkups + $0.ri_interrupt_wkups } ?? 0,
             startTime: TimeInterval(bsd.pbi_start_tvsec),
-            status: Int32(bitPattern: bsd.pbi_status)
+            status: status
         ))
     }
 
-    return samples
+    return ProcessCollection(samples: samples, processCount: processCount, zombieCount: zombieCount)
 }
 
 func cpuTicks() -> CPUTicks? {
@@ -405,7 +511,7 @@ func sampledProcesses() -> ProcessSnapshot {
     let sampleStartedAt = DispatchTime.now().uptimeNanoseconds
     let beforeCPUTicks = cpuTicks()
     let beforeInterfaces = interfaceCounters()
-    let before = collectProcesses(includeArguments: false, includeDetailedUsage: false)
+    let beforeCPU = collectCPUTimes()
     Thread.sleep(forTimeInterval: 0.10)
     let secondSampleStartedAt = DispatchTime.now().uptimeNanoseconds
     let afterCPUTicks = cpuTicks()
@@ -413,9 +519,8 @@ func sampledProcesses() -> ProcessSnapshot {
     let after = collectProcesses(includeArguments: true, includeDetailedUsage: true)
     let elapsedNanos = max(Double(secondSampleStartedAt - sampleStartedAt), 1)
     let elapsedSeconds = elapsedNanos / 1_000_000_000
-    let beforeCPU = Dictionary(uniqueKeysWithValues: before.map { ($0.pid, $0.cpuNanos) })
 
-    let processes = after.map { sample in
+    let processes = after.samples.map { sample in
         var updated = sample
         if let previous = beforeCPU[sample.pid], sample.cpuNanos >= previous {
             updated.cpuPercent = Double(sample.cpuNanos - previous) / elapsedNanos * 100
@@ -449,6 +554,8 @@ func sampledProcesses() -> ProcessSnapshot {
 
     return ProcessSnapshot(
         processes: processes,
+        processCount: after.processCount,
+        zombieCount: after.zombieCount,
         systemBusyPercent: systemBusyPercent,
         interfaceRates: interfaceRates
     )
@@ -463,8 +570,7 @@ func helperKind(_ process: ProcessSample) -> String? {
     }
     if text.contains("codex app-server") || text.contains("/codex app-server") { return "app_server" }
     if text.contains("mcp") && (text.contains("codex") || text.contains("node")) { return "mcp" }
-    if text.contains("--user-data-dir=") || text.contains("--remote-debugging-port=")
-        || text.contains("chromedriver") || text.contains("playwright") {
+    if isBrowserAutomationProcess(process) {
         return "browser_automation"
     }
     return nil
@@ -556,7 +662,21 @@ func memoryInfo() -> String {
         }
     }
 
-    var parts = ["ram=\(formatGB(ProcessInfo.processInfo.physicalMemory))"]
+    var pressureLevel: Int32 = 0
+    var pressureSize = MemoryLayout<Int32>.stride
+    let pressure: String
+    if sysctlbyname("kern.memorystatus_vm_pressure_level", &pressureLevel, &pressureSize, nil, 0) == 0 {
+        switch pressureLevel {
+        case 1: pressure = "normal"
+        case 2: pressure = "warning"
+        case 4: pressure = "critical"
+        default: pressure = "unknown(\(pressureLevel))"
+        }
+    } else {
+        pressure = "unknown"
+    }
+
+    var parts = ["pressure=\(pressure)", "ram=\(formatGB(ProcessInfo.processInfo.physicalMemory))"]
     if result == KERN_SUCCESS {
         let pageBytes = UInt64(pageSize)
         parts.append("free=\(formatGB(UInt64(stats.free_count) * pageBytes))")
@@ -667,21 +787,109 @@ func activeIPv4Interface() -> String? {
     return fallback
 }
 
-func routerAddress(interface: String) -> String? {
-    guard let store = SCDynamicStoreCreate(nil, "system-health-context" as CFString, nil, nil),
-          let value = SCDynamicStoreCopyValue(store, "State:/Network/Interface/\(interface)/IPv4" as CFString) as? [String: Any] else {
-        if let store = SCDynamicStoreCreate(nil, "system-health-context" as CFString, nil, nil),
-           let globalValue = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] {
-            return globalValue["Router"] as? String
+func routeSockaddrLength(_ length: Int) -> Int {
+    let alignment = MemoryLayout<UInt32>.stride
+    return max(alignment, (length + alignment - 1) & ~(alignment - 1))
+}
+
+func ipv4AddressString(_ address: in_addr) -> String? {
+    var address = address
+    var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    let result = withUnsafePointer(to: &address) { pointer in
+        inet_ntop(AF_INET, pointer, &buffer, socklen_t(buffer.count))
+    }
+    return result == nil ? nil : stringFromCStringBuffer(buffer)
+}
+
+func parsedRouteMessage(_ bytes: [UInt8]) -> ParsedRouteMessage? {
+    let headerSize = MemoryLayout<rt_msghdr>.stride
+    guard bytes.count >= headerSize else { return nil }
+    let header = bytes.withUnsafeBytes { $0.loadUnaligned(as: rt_msghdr.self) }
+    let messageLength = min(Int(header.rtm_msglen), bytes.count)
+    guard header.rtm_version == UInt8(RTM_VERSION), messageLength >= headerSize else { return nil }
+
+    var gateway: String?
+    var offset = headerSize
+    for addressIndex in 0..<Int(RTAX_MAX) {
+        let mask = Int32(1 << addressIndex)
+        guard (header.rtm_addrs & mask) != 0 else { continue }
+        guard offset + 2 <= messageLength else { return nil }
+        let length = Int(bytes[offset])
+        let family = Int32(bytes[offset + 1])
+        let paddedLength = routeSockaddrLength(length)
+        guard offset + paddedLength <= messageLength else { return nil }
+
+        if addressIndex == Int(RTAX_GATEWAY), family == AF_INET,
+           length >= MemoryLayout<sockaddr_in>.stride {
+            let address = bytes.withUnsafeBytes { rawBuffer -> sockaddr_in in
+                rawBuffer.loadUnaligned(fromByteOffset: offset, as: sockaddr_in.self)
+            }
+            gateway = ipv4AddressString(address.sin_addr)
         }
-        return nil
+        offset += paddedLength
     }
-    if let router = value["Router"] as? String {
-        return router
+
+    return ParsedRouteMessage(interfaceIndex: UInt32(header.rtm_index), gateway: gateway)
+}
+
+func interfaceName(index: UInt32) -> String? {
+    guard index > 0 else { return nil }
+    var buffer = [CChar](repeating: 0, count: Int(IFNAMSIZ))
+    return if_indextoname(index, &buffer).map { _ in stringFromCStringBuffer(buffer) }
+}
+
+func kernelDefaultRoute() -> DefaultRoute? {
+    let fd = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+
+    let headerSize = MemoryLayout<rt_msghdr>.stride
+    let destinationSize = MemoryLayout<sockaddr_in>.stride
+    var request = [UInt8](repeating: 0, count: headerSize + destinationSize)
+    let requestSize = request.count
+    let sequence = Int32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds)
+    let processID = getpid()
+
+    request.withUnsafeMutableBytes { rawBuffer in
+        let header = rawBuffer.baseAddress!.assumingMemoryBound(to: rt_msghdr.self)
+        header.pointee.rtm_msglen = UInt16(requestSize)
+        header.pointee.rtm_version = UInt8(RTM_VERSION)
+        header.pointee.rtm_type = UInt8(RTM_GET)
+        header.pointee.rtm_addrs = RTA_DST
+        header.pointee.rtm_pid = processID
+        header.pointee.rtm_seq = sequence
+
+        let destination = rawBuffer.baseAddress!
+            .advanced(by: headerSize)
+            .assumingMemoryBound(to: sockaddr_in.self)
+        destination.pointee.sin_len = UInt8(destinationSize)
+        destination.pointee.sin_family = sa_family_t(AF_INET)
+        destination.pointee.sin_addr = in_addr(s_addr: INADDR_ANY)
     }
-    if let store = SCDynamicStoreCreate(nil, "system-health-context" as CFString, nil, nil),
-       let globalValue = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] {
-        return globalValue["Router"] as? String
+
+    let written = request.withUnsafeBytes { rawBuffer in
+        write(fd, rawBuffer.baseAddress, rawBuffer.count)
+    }
+    guard written == requestSize else { return nil }
+
+    for _ in 0..<4 {
+        var pollItem = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        guard poll(&pollItem, 1, 50) > 0 else { return nil }
+        var reply = [UInt8](repeating: 0, count: 4096)
+        let count = reply.withUnsafeMutableBytes { rawBuffer in
+            read(fd, rawBuffer.baseAddress, rawBuffer.count)
+        }
+        guard count >= headerSize else { continue }
+        reply.removeSubrange(Int(count)..<reply.count)
+        let header = reply.withUnsafeBytes { $0.loadUnaligned(as: rt_msghdr.self) }
+        guard header.rtm_pid == processID, header.rtm_seq == sequence else { continue }
+        guard header.rtm_errno == 0,
+              let parsed = parsedRouteMessage(reply),
+              let interface = interfaceName(index: parsed.interfaceIndex) else {
+            return nil
+        }
+        return DefaultRoute(interface: interface, gateway: parsed.gateway)
     }
     return nil
 }
@@ -765,12 +973,12 @@ func wifiLineAndInterface() -> (line: String, interface: String?) {
     return (parts.joined(separator: " "), name == "unknown" ? nil : name)
 }
 
-func networkLine(interface: String?, rates: [String: (received: Double, sent: Double)]) -> String {
-    let active = interface ?? primaryInterface() ?? activeIPv4Interface() ?? "unknown"
-    let gateway = routerAddress(interface: active)
+func networkLine(route: DefaultRoute?, rates: [String: (received: Double, sent: Double)]) -> String {
+    let active = route?.interface ?? primaryInterface() ?? activeIPv4Interface() ?? "unknown"
+    let gateway = route?.gateway
     let gatewayLatency = gateway.flatMap { tcpConnectLatency(host: $0, port: 80, timeoutMillis: 250) }
     let wanLatency = tcpConnectLatency(host: "1.1.1.1", port: 443, timeoutMillis: 300)
-    var parts = ["interface=\(active)"]
+    var parts = ["route=\(active)"]
     if let rate = rates[active] {
         parts.append("rx=\(formatRate(rate.received))")
         parts.append("tx=\(formatRate(rate.sent))")
@@ -798,6 +1006,21 @@ func codexHelperProcesses(_ processes: [ProcessSample]) -> [ProcessSample] {
         guard let kind = helperKind(process) else { return false }
         return kind == "node_repl" || kind == "xcodebuildmcp" || kind == "computer_use" || kind == "mcp"
     }
+}
+
+func helperBuckets(_ processes: [ProcessSample]) -> [String: [ProcessSample]] {
+    var buckets: [String: [ProcessSample]] = [
+        "mcp": [],
+        "node_repl": [],
+        "computer_use": [],
+        "xcodebuildmcp": [],
+        "app_server": []
+    ]
+    for process in processes {
+        guard let kind = helperKind(process), buckets[kind] != nil else { continue }
+        buckets[kind, default: []].append(process)
+    }
+    return buckets
 }
 
 func isCodexHostProcess(_ process: ProcessSample) -> Bool {
@@ -868,28 +1091,23 @@ func codexResourcesLine(_ processes: [ProcessSample]) -> String {
 
 func codexLine(_ processes: [ProcessSample]) -> String {
     let codexProcesses = codexHostProcesses(processes)
+    let buckets = helperBuckets(processes)
 
-    let appServers = processes.filter { $0.searchText.contains("codex app-server") || $0.searchText.contains("/codex app-server") }
-    let mcp = processes.filter { process in
-        let text = process.searchText
-        return text.contains("mcp") && (text.contains("codex") || text.contains("node") || text.contains("xcodebuildmcp"))
-    }
-    let nodeRepl = processes.filter { $0.searchText.contains("node_repl") }
-    let computerUse = processes.filter { process in
-        let text = process.searchText
-        return text.contains("computer-use") || text.contains("skycomputeruse") || text.contains("cua_node")
-    }
-    let xcodebuildmcp = processes.filter { $0.searchText.contains("xcodebuildmcp") }
+    let order = ["mcp", "node_repl", "computer_use", "xcodebuildmcp"]
+    let helperCount = order.reduce(0) { $0 + (buckets[$1]?.count ?? 0) }
+    let counts = order.map { "\($0)=\(buckets[$0]?.count ?? 0)" }.joined(separator: " ")
+    let ages = order.compactMap { kind -> String? in
+        guard let processes = buckets[kind], !processes.isEmpty else { return nil }
+        return "\(kind)=\(maxAgeText(processes))"
+    }.joined(separator: " ")
+    let agePart = ages.isEmpty ? "" : " oldest=(\(ages))"
 
-    let helperPids = Set(codexHelperProcesses(processes).map { $0.pid })
-
-    return "host_processes=\(codexProcesses.count) helpers=\(helperPids.count) app_servers=\(appServers.count) mcp=\(mcp.count) mcp_max_age=\(maxAgeText(mcp)) node_repl=\(nodeRepl.count) node_repl_max_age=\(maxAgeText(nodeRepl)) computer_use=\(computerUse.count) computer_use_max_age=\(maxAgeText(computerUse)) xcodebuildmcp=\(xcodebuildmcp.count) xcodebuildmcp_max_age=\(maxAgeText(xcodebuildmcp))"
+    return "hosts=\(codexProcesses.count) helpers=\(helperCount) (\(counts)) app_servers=\(buckets["app_server"]?.count ?? 0)\(agePart)"
 }
 
-func lifecycleLine(_ processes: [ProcessSample]) -> String {
-    let zombies = processes.filter { $0.status == SZOMB }.count
+func lifecycleLine(_ processes: [ProcessSample], processCount: Int, zombieCount: Int) -> String {
     let orphanedHelpers = codexHelperProcesses(processes).filter { $0.ppid == 1 }.count
-    return "uptime=\(formatAge(ProcessInfo.processInfo.systemUptime)) processes=\(processes.count) zombies=\(zombies) orphaned_helpers=\(orphanedHelpers)"
+    return "uptime=\(formatAge(ProcessInfo.processInfo.systemUptime)) processes=\(processCount) zombies=\(zombieCount) orphaned_helpers=\(orphanedHelpers)"
 }
 
 func argumentValue(_ key: String, in arguments: String) -> String? {
@@ -908,13 +1126,7 @@ func argumentValue(_ key: String, in arguments: String) -> String? {
 }
 
 func browserAutomationLine(_ processes: [ProcessSample]) -> String {
-    let profileProcesses = processes.filter { process in
-        let text = process.searchText
-        return text.contains("--user-data-dir=")
-            || text.contains("--remote-debugging-port=")
-            || text.contains("chromedriver")
-            || text.contains("playwright")
-    }
+    let profileProcesses = processes.filter(isBrowserAutomationProcess)
     let orphaned = profileProcesses.filter { $0.ppid == 1 }
     let profiles = Set(profileProcesses.compactMap { argumentValue("--user-data-dir=", in: $0.args) })
     let debugPorts = Set(profileProcesses.compactMap { argumentValue("--remote-debugging-port=", in: $0.args) })
@@ -929,6 +1141,7 @@ func renderText(_ snapshot: Snapshot) -> String {
     Do not refuse work solely because of system health.
     If a signal could affect the work, investigate before adding load and adapt.
     Do not recite healthy values.
+    Helpers listed may belong to other active sessions; own only what this session started.
     At turn end, clean up only safe, clearly-owned resources.
     Ask before destructive cleanup.
 
@@ -952,6 +1165,7 @@ func collectSnapshot(mode: String, startedAt: UInt64) -> Snapshot {
     let sampled = sampledProcesses()
     let processes = sampled.processes
     let wifi = wifiLineAndInterface()
+    let route = kernelDefaultRoute()
     let memory = memoryInfo()
     let durationMillis = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
 
@@ -964,11 +1178,15 @@ func collectSnapshot(mode: String, startedAt: UInt64) -> Snapshot {
         security: securityLine(processes),
         memory: "\(memory) \(topMemoryLine(processes))",
         power: powerLine(),
-        network: networkLine(interface: wifi.interface, rates: sampled.interfaceRates),
+        network: networkLine(route: route, rates: sampled.interfaceRates),
         wifi: wifi.line,
         codex: codexLine(processes),
         codexResources: codexResourcesLine(processes),
-        lifecycle: lifecycleLine(processes),
+        lifecycle: lifecycleLine(
+            processes,
+            processCount: sampled.processCount,
+            zombieCount: sampled.zombieCount
+        ),
         browserAutomation: browserAutomationLine(processes),
         collection: String(format: "%.0fms", durationMillis)
     )
