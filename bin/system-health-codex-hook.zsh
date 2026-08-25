@@ -11,33 +11,33 @@ case "$mode" in
   *) mode="turn_start" ;;
 esac
 
-if [[ "$mode" == "turn_end" ]]; then
-  printf '{"suppressOutput":true}\n'
-  exit 0
-fi
-
 if [[ -x "$collector" ]]; then
   if [[ -n "${SYSTEM_HEALTH_HOOK_LATEST_DIR:-}" ]]; then
+    umask 077
     latest_dir="${SYSTEM_HEALTH_HOOK_LATEST_DIR}"
     mkdir -p "$latest_dir"
     tmp="$latest_dir/${mode}.$$"
     err="$latest_dir/${mode}.$$.err"
     out="$latest_dir/${mode}.txt"
     trap 'rm -f "$tmp" "$err"' EXIT
-    "$collector" "$mode" > "$tmp" 2> "$err"
-    mv "$tmp" "$out"
+    "$collector" --codex-hook "$mode" > "$tmp" 2> "$err"
     if [[ -s "$err" ]]; then
-      mv "$err" "$latest_dir/${mode}.err"
+      mv -f "$err" "$latest_dir/${mode}.err"
     else
       rm -f "$err"
     fi
-    cat "$out"
+    cat "$tmp"
+    mv -f "$tmp" "$out"
   else
-    exec "$collector" "$mode"
+    exec "$collector" --codex-hook "$mode"
   fi
 else
-  echo "System Health Context"
-  echo
-  echo "Use this as cheap local machine context."
-  echo "System health collector missing: $collector"
+  if [[ "$mode" == "turn_end" ]]; then
+    printf '{}\n'
+  else
+    echo "System Health Context"
+    echo
+    echo "Use this as cheap local machine context."
+    echo "System health collector missing: $collector"
+  fi
 fi

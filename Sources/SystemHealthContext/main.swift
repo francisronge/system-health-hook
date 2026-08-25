@@ -4,7 +4,7 @@ import Foundation
 import IOKit.ps
 import SystemConfiguration
 
-let hookVersion = "0.4.0"
+func currentHookVersion() -> String { "0.5.0" }
 
 let machTimebase: mach_timebase_info_data_t = {
     var info = mach_timebase_info_data_t()
@@ -98,17 +98,19 @@ struct Snapshot {
     let security: String
     let memory: String
     let power: String
+    let thermals: String
     let network: String
     let wifi: String
     let codex: String
     let codexResources: String
     let lifecycle: String
     let browserAutomation: String
+    let attention: AttentionAssessment
     let collection: String
 
     func jsonObject() -> [String: Any] {
-        [
-            "hook_version": hookVersion,
+        var object: [String: Any] = [
+            "hook_version": currentHookVersion(),
             "mode": mode,
             "timestamp": timestamp,
             "host": host,
@@ -117,14 +119,20 @@ struct Snapshot {
             "security": security,
             "memory": memory,
             "power": power,
-            "network": network,
-            "wifi": wifi,
+            "thermals": thermals,
             "codex": codex,
             "codex_resources": codexResources,
             "lifecycle": lifecycle,
             "browser_automation": browserAutomation,
+            "attention": [
+                "required": attention.required,
+                "reasons": attention.reasons.map { ["code": $0.code, "summary": $0.summary] }
+            ],
             "collection": collection
         ]
+        if !network.isEmpty { object["network"] = network }
+        if !wifi.isEmpty { object["wifi"] = wifi }
+        return object
     }
 }
 
@@ -219,8 +227,7 @@ func formatAge(_ seconds: TimeInterval) -> String {
     return "\(Int(seconds))s"
 }
 
-func storageLine() -> String {
-    var diskPart = "disk=unknown free=unknown"
+func storageStatus() -> StorageStatus {
     var fs = statfs()
     if statfs(NSHomeDirectory(), &fs) == 0, fs.f_blocks > 0 {
         let blockSize = UInt64(fs.f_bsize)
@@ -228,10 +235,9 @@ func storageLine() -> String {
         let available = UInt64(fs.f_bavail) * blockSize
         let used = total > available ? total - available : 0
         let usedPercent = Double(used) / Double(total) * 100
-        diskPart = "disk=\(Int(usedPercent.rounded()))% free=\(formatGB(available))"
+        return StorageStatus(usedPercent: usedPercent, freeBytes: available)
     }
-
-    return diskPart
+    return StorageStatus(usedPercent: nil, freeBytes: nil)
 }
 
 func processName(pid: pid_t) -> String {
@@ -349,8 +355,10 @@ func shouldReadArguments(name: String, path: String) -> Bool {
         || text.contains("playwright")
         || text.contains("discord")
         || text.contains("skycomputer")
+        || containsDelimitedIdentifier("computer-use", in: text)
+        || containsDelimitedIdentifier("computer_use", in: text)
+        || containsDelimitedIdentifier("cua_node", in: text)
         || text.contains("screencapture")
-        || text.contains("cua")
 }
 
 func shouldCollectDetailedUsage(name: String, path: String, args: String) -> Bool {
@@ -368,10 +376,35 @@ func shouldCollectDetailedUsage(name: String, path: String, args: String) -> Boo
         || identity.contains("trustd")
         || identity.contains("sandboxd")
         || identity.contains("skycomputer")
-        || identity.contains("cua_node")
+        || containsDelimitedIdentifier("computer-use", in: identity)
+        || containsDelimitedIdentifier("computer_use", in: identity)
+        || containsDelimitedIdentifier("cua_node", in: identity)
         || details.contains("node_repl")
-        || details.contains("computer-use")
+        || containsDelimitedIdentifier("computer-use", in: details)
+        || containsDelimitedIdentifier("computer_use", in: details)
+        || containsDelimitedIdentifier("cua_node", in: details)
         || isBrowserAutomationIdentity(identity: identity, arguments: details)
+}
+
+func containsDelimitedIdentifier(_ identifier: String, in text: String) -> Bool {
+    guard !identifier.isEmpty else { return false }
+    var searchStart = text.startIndex
+    while searchStart < text.endIndex,
+          let range = text.range(of: identifier, range: searchStart..<text.endIndex) {
+        let leftIsIdentifier = range.lowerBound > text.startIndex
+            && isIdentifierCharacter(text[text.index(before: range.lowerBound)])
+        let rightIsIdentifier = range.upperBound < text.endIndex
+            && isIdentifierCharacter(text[range.upperBound])
+        if !leftIsIdentifier && !rightIsIdentifier {
+            return true
+        }
+        searchStart = range.upperBound
+    }
+    return false
+}
+
+private func isIdentifierCharacter(_ character: Character) -> Bool {
+    character.isLetter || character.isNumber || character == "_" || character == "-"
 }
 
 func isBrowserAutomationIdentity(identity: String, arguments: String) -> Bool {
@@ -507,12 +540,16 @@ func interfaceCounters() -> [String: InterfaceCounters] {
     return counters
 }
 
-func sampledProcesses() -> ProcessSnapshot {
+func sampledProcesses(whileWaiting: (() -> Void)? = nil) -> ProcessSnapshot {
     let sampleStartedAt = DispatchTime.now().uptimeNanoseconds
     let beforeCPUTicks = cpuTicks()
     let beforeInterfaces = interfaceCounters()
     let beforeCPU = collectCPUTimes()
-    Thread.sleep(forTimeInterval: 0.10)
+    whileWaiting?()
+    let workElapsed = Double(DispatchTime.now().uptimeNanoseconds - sampleStartedAt) / 1_000_000_000
+    if workElapsed < 0.10 {
+        Thread.sleep(forTimeInterval: 0.10 - workElapsed)
+    }
     let secondSampleStartedAt = DispatchTime.now().uptimeNanoseconds
     let afterCPUTicks = cpuTicks()
     let afterInterfaces = interfaceCounters()
@@ -563,12 +600,15 @@ func sampledProcesses() -> ProcessSnapshot {
 
 func helperKind(_ process: ProcessSample) -> String? {
     let text = process.searchText
+    if text.contains("codex app-server") || text.contains("/codex app-server") { return "app_server" }
     if text.contains("node_repl") { return "node_repl" }
     if text.contains("xcodebuildmcp") { return "xcodebuildmcp" }
-    if text.contains("computer-use") || text.contains("skycomputeruse") || text.contains("cua_node") {
+    if containsDelimitedIdentifier("computer-use", in: text)
+        || containsDelimitedIdentifier("computer_use", in: text)
+        || containsDelimitedIdentifier("skycomputeruse", in: text)
+        || containsDelimitedIdentifier("cua_node", in: text) {
         return "computer_use"
     }
-    if text.contains("codex app-server") || text.contains("/codex app-server") { return "app_server" }
     if text.contains("mcp") && (text.contains("codex") || text.contains("node")) { return "mcp" }
     if isBrowserAutomationProcess(process) {
         return "browser_automation"
@@ -631,13 +671,13 @@ func topCPULine(_ processes: [ProcessSample], systemBusyPercent: Double?) -> Str
     return "cores=\(cores) \(busyPart) \(loadPart) top=\(top.isEmpty ? "none" : top)"
 }
 
-func securityLine(_ processes: [ProcessSample]) -> String {
+func securityStatus(_ processes: [ProcessSample]) -> SecurityStatus {
     var syspolicyd = 0.0
     var trustd = 0.0
     var sandboxd = 0.0
 
     for process in processes {
-        let text = process.searchText
+        let text = "\(process.name) \(process.path)".lowercased()
         if text.contains("syspolicyd") {
             syspolicyd += process.cpuPercent
         } else if text.contains("sandboxd") {
@@ -647,10 +687,14 @@ func securityLine(_ processes: [ProcessSample]) -> String {
         }
     }
 
-    return "syspolicyd=\(formatPercent(syspolicyd)) trustd=\(formatPercent(trustd)) sandboxd=\(formatPercent(sandboxd))"
+    return SecurityStatus(
+        syspolicydCPU: syspolicyd,
+        trustdCPU: trustd,
+        sandboxdCPU: sandboxd
+    )
 }
 
-func memoryInfo() -> String {
+func memoryStatus() -> MemoryStatus {
     var pageSize: vm_size_t = 0
     host_page_size(mach_host_self(), &pageSize)
 
@@ -664,19 +708,19 @@ func memoryInfo() -> String {
 
     var pressureLevel: Int32 = 0
     var pressureSize = MemoryLayout<Int32>.stride
-    let pressure: String
+    let pressure: MemoryPressureLevel
     if sysctlbyname("kern.memorystatus_vm_pressure_level", &pressureLevel, &pressureSize, nil, 0) == 0 {
         switch pressureLevel {
-        case 1: pressure = "normal"
-        case 2: pressure = "warning"
-        case 4: pressure = "critical"
-        default: pressure = "unknown(\(pressureLevel))"
+        case 1: pressure = .normal
+        case 2: pressure = .warning
+        case 4: pressure = .critical
+        default: pressure = .unknown
         }
     } else {
-        pressure = "unknown"
+        pressure = .unknown
     }
 
-    var parts = ["pressure=\(pressure)", "ram=\(formatGB(ProcessInfo.processInfo.physicalMemory))"]
+    var parts = ["ram=\(formatGB(ProcessInfo.processInfo.physicalMemory))"]
     if result == KERN_SUCCESS {
         let pageBytes = UInt64(pageSize)
         parts.append("free=\(formatGB(UInt64(stats.free_count) * pageBytes))")
@@ -693,7 +737,7 @@ func memoryInfo() -> String {
         parts.append("swap=\(formatGB(UInt64(swap.xsu_used)))")
     }
 
-    return parts.joined(separator: " ")
+    return MemoryStatus(pressure: pressure, detail: parts.joined(separator: " "))
 }
 
 func topMemoryLine(_ processes: [ProcessSample]) -> String {
@@ -735,16 +779,7 @@ func powerLine() -> String {
     }
 
     let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled ? "on" : "off"
-    let thermal: String
-    switch ProcessInfo.processInfo.thermalState {
-    case .nominal: thermal = "nominal"
-    case .fair: thermal = "fair"
-    case .serious: thermal = "serious"
-    case .critical: thermal = "critical"
-    @unknown default: thermal = "unknown"
-    }
-
-    return "source=\(source) battery=\(battery) charging=\(charging) low_power=\(lowPower) thermal_pressure=\(thermal)"
+    return "source=\(source) battery=\(battery) charging=\(charging) low_power=\(lowPower)"
 }
 
 func primaryInterface() -> String? {
@@ -1042,20 +1077,30 @@ func codexRelevantProcesses(_ processes: [ProcessSample]) -> [ProcessSample] {
     }
 }
 
-func lifetimeAverageCPU(_ process: ProcessSample) -> Double {
-    let age = Date().timeIntervalSince1970 - process.startTime
+func lifetimeAverageCPU(
+    _ process: ProcessSample,
+    now: TimeInterval = Date().timeIntervalSince1970
+) -> Double {
+    let age = now - process.startTime
     guard age > 0 else { return 0 }
     return Double(process.lifetimeCpuNanos) / (age * 1_000_000_000) * 100
 }
 
-func lifetimeAverageRate(bytes: UInt64, process: ProcessSample) -> Double {
-    let age = Date().timeIntervalSince1970 - process.startTime
+func lifetimeAverageRate(
+    bytes: UInt64,
+    process: ProcessSample,
+    now: TimeInterval = Date().timeIntervalSince1970
+) -> Double {
+    let age = now - process.startTime
     guard age > 0 else { return 0 }
     return Double(bytes) / age
 }
 
-func lifetimeWakeupRate(_ process: ProcessSample) -> Double {
-    let age = Date().timeIntervalSince1970 - process.startTime
+func lifetimeWakeupRate(
+    _ process: ProcessSample,
+    now: TimeInterval = Date().timeIntervalSince1970
+) -> Double {
+    let age = now - process.startTime
     guard age > 0 else { return 0 }
     return Double(process.idleWakeups) / age
 }
@@ -1106,8 +1151,8 @@ func codexLine(_ processes: [ProcessSample]) -> String {
 }
 
 func lifecycleLine(_ processes: [ProcessSample], processCount: Int, zombieCount: Int) -> String {
-    let orphanedHelpers = codexHelperProcesses(processes).filter { $0.ppid == 1 }.count
-    return "uptime=\(formatAge(ProcessInfo.processInfo.systemUptime)) processes=\(processCount) zombies=\(zombieCount) orphaned_helpers=\(orphanedHelpers)"
+    let parentPID1Helpers = codexHelperProcesses(processes).filter { $0.ppid == 1 }.count
+    return "uptime=\(formatAge(ProcessInfo.processInfo.systemUptime)) processes=\(processCount) zombies=\(zombieCount) parent_pid_1_helpers=\(parentPID1Helpers)"
 }
 
 func argumentValue(_ key: String, in arguments: String) -> String? {
@@ -1127,58 +1172,77 @@ func argumentValue(_ key: String, in arguments: String) -> String? {
 
 func browserAutomationLine(_ processes: [ProcessSample]) -> String {
     let profileProcesses = processes.filter(isBrowserAutomationProcess)
-    let orphaned = profileProcesses.filter { $0.ppid == 1 }
+    let parentPID1 = profileProcesses.filter { $0.ppid == 1 }
     let profiles = Set(profileProcesses.compactMap { argumentValue("--user-data-dir=", in: $0.args) })
     let debugPorts = Set(profileProcesses.compactMap { argumentValue("--remote-debugging-port=", in: $0.args) })
-    return "processes=\(profileProcesses.count) profiles=\(profiles.count) orphaned=\(orphaned.count) debug_ports=\(debugPorts.count)"
+    return "processes=\(profileProcesses.count) profiles=\(profiles.count) parent_pid_1=\(parentPID1.count) debug_ports=\(debugPorts.count)"
 }
 
 func renderText(_ snapshot: Snapshot) -> String {
-    """
-    System Health Context
-
-    Treat this as operational context, not decoration.
-    Do not refuse work solely because of system health.
-    If a signal could affect the work, investigate before adding load and adapt.
-    Do not recite healthy values.
-    Helpers listed may belong to other active sessions; own only what this session started.
-    At turn end, clean up only safe, clearly-owned resources.
-    Ask before destructive cleanup.
-
-    Header: hook_version=\(hookVersion) mode=\(snapshot.mode) timestamp=\(snapshot.timestamp) host=\(snapshot.host)
-    Storage: \(snapshot.storage)
-    CPU: \(snapshot.cpu)
-    Security: \(snapshot.security)
-    Memory: \(snapshot.memory)
-    Power: \(snapshot.power)
-    Network: \(snapshot.network)
-    WiFi: \(snapshot.wifi)
-    Codex: \(snapshot.codex)
-    CodexResources: \(snapshot.codexResources)
-    Lifecycle: \(snapshot.lifecycle)
-    BrowserAutomation: \(snapshot.browserAutomation)
-    Collection: \(snapshot.collection)
-    """
+    var lines = [
+        "System Health Context",
+        "",
+        "Use this snapshot as operational context.",
+        "Do not refuse work solely because of system health.",
+        "If Attention is required, investigate the listed facts before adding more load. Do not wait for the user to notice.",
+        "Do not recite healthy values.",
+        "Helpers listed may belong to other active sessions; own only what this session started.",
+        "At turn end, clean up only safe, clearly-owned resources.",
+        "Ask before destructive cleanup.",
+        "",
+        "Attention: \(snapshot.attention.line)",
+        "Header: hook_version=\(currentHookVersion()) mode=\(snapshot.mode) timestamp=\(snapshot.timestamp) host=\(snapshot.host)",
+        "Storage: \(snapshot.storage)",
+        "CPU: \(snapshot.cpu)",
+        "Security: \(snapshot.security)",
+        "Memory: \(snapshot.memory)",
+        "Power: \(snapshot.power)",
+        "Thermals: \(snapshot.thermals)"
+    ]
+    if !snapshot.network.isEmpty { lines.append("Network: \(snapshot.network)") }
+    if !snapshot.wifi.isEmpty { lines.append("WiFi: \(snapshot.wifi)") }
+    lines.append(contentsOf: [
+        "Codex: \(snapshot.codex)",
+        "CodexResources: \(snapshot.codexResources)",
+        "Lifecycle: \(snapshot.lifecycle)",
+        "BrowserAutomation: \(snapshot.browserAutomation)",
+        "Collection: \(snapshot.collection)"
+    ])
+    return lines.joined(separator: "\n")
 }
 
-func collectSnapshot(mode: String, startedAt: UInt64) -> Snapshot {
-    let sampled = sampledProcesses()
+func collectSnapshot(mode: String, startedAt: UInt64, includeConnectivity: Bool = true) -> Snapshot {
+    var thermals = ThermalSnapshot(readings: [], fans: nil, macOSState: macOSThermalState())
+    let sampled = sampledProcesses {
+        thermals = collectThermalSnapshot()
+    }
     let processes = sampled.processes
-    let wifi = wifiLineAndInterface()
-    let route = kernelDefaultRoute()
-    let memory = memoryInfo()
+    let storage = storageStatus()
+    let security = securityStatus(processes)
+    let memory = memoryStatus()
+    let attention = assessAttention(
+        storage: storage,
+        memory: memory,
+        security: security,
+        thermals: thermals,
+        processes: processes
+    )
+    let wifi = includeConnectivity ? wifiLineAndInterface() : (line: "", interface: nil)
+    let route = includeConnectivity ? kernelDefaultRoute() : nil
+    let network = includeConnectivity ? networkLine(route: route, rates: sampled.interfaceRates) : ""
     let durationMillis = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
 
     return Snapshot(
         mode: mode,
         timestamp: isoTimestamp(),
         host: hostname(),
-        storage: storageLine(),
+        storage: storage.line,
         cpu: topCPULine(processes, systemBusyPercent: sampled.systemBusyPercent),
-        security: securityLine(processes),
-        memory: "\(memory) \(topMemoryLine(processes))",
+        security: security.line,
+        memory: "\(memory.line) \(topMemoryLine(processes))",
         power: powerLine(),
-        network: networkLine(route: route, rates: sampled.interfaceRates),
+        thermals: thermals.line,
+        network: network,
         wifi: wifi.line,
         codex: codexLine(processes),
         codexResources: codexResourcesLine(processes),
@@ -1188,24 +1252,91 @@ func collectSnapshot(mode: String, startedAt: UInt64) -> Snapshot {
             zombieCount: sampled.zombieCount
         ),
         browserAutomation: browserAutomationLine(processes),
+        attention: attention,
         collection: String(format: "%.0fms", durationMillis)
     )
 }
 
+struct CodexStopHookInput: Decodable {
+    let stopHookActive: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case stopHookActive = "stop_hook_active"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        stopHookActive = try container.decodeIfPresent(Bool.self, forKey: .stopHookActive) ?? false
+    }
+}
+
+func decodeStopHookActive(_ data: Data) -> Bool {
+    guard !data.isEmpty,
+          let decoded = try? JSONDecoder().decode(CodexStopHookInput.self, from: data) else {
+        return false
+    }
+    return decoded.stopHookActive
+}
+
+func stopContinuationReason(_ assessment: AttentionAssessment) -> String {
+    let facts = assessment.reasons.map(\.summary).joined(separator: "; ")
+    return """
+    Continue the current task. Before finishing, investigate only the listed health signal far enough to decide whether this work is causing it: \(facts). Adapt the work or clean up safe, clearly-owned leftovers from this task if needed. Then finish the original request. Do not replace the requested result with a system-health report. Mention system health only if it affected the work or requires user action. Do not terminate resources that may belong to another active task.
+    """
+}
+
+func codexHookOutput(mode: String, snapshot: Snapshot, stopHookActive: Bool = false) -> [String: Any] {
+    if mode == "turn_end" {
+        guard snapshot.attention.required, !stopHookActive else { return [:] }
+        return [
+            "decision": "block",
+            "reason": stopContinuationReason(snapshot.attention)
+        ]
+    }
+    return [
+        "hookSpecificOutput": [
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": renderText(snapshot)
+        ]
+    ]
+}
+
+func printJSON(_ object: [String: Any], pretty: Bool = false) throws {
+    let options: JSONSerialization.WritingOptions = pretty ? [.prettyPrinted, .sortedKeys] : [.sortedKeys]
+    let data = try JSONSerialization.data(withJSONObject: object, options: options)
+    print(String(data: data, encoding: .utf8) ?? "{}")
+}
+
 let args = CommandLine.arguments.dropFirst()
 if args.contains("--version") {
-    print(hookVersion)
+    print(currentHookVersion())
     exit(0)
 }
 
 let outputJSON = args.contains("--json")
+let codexHook = args.contains("--codex-hook")
 let mode = args.first { $0 == "turn_start" || $0 == "turn_end" } ?? "turn_start"
-let startedAt = DispatchTime.now().uptimeNanoseconds
-let snapshot = collectSnapshot(mode: mode, startedAt: startedAt)
+var stopHookActive = false
+if codexHook, mode == "turn_end" {
+    let input = FileHandle.standardInput.readDataToEndOfFile()
+    stopHookActive = decodeStopHookActive(input)
+    if stopHookActive {
+        try printJSON([:])
+        exit(0)
+    }
+}
 
-if outputJSON {
-    let data = try JSONSerialization.data(withJSONObject: snapshot.jsonObject(), options: [.prettyPrinted, .sortedKeys])
-    print(String(data: data, encoding: .utf8) ?? "{}")
+let startedAt = DispatchTime.now().uptimeNanoseconds
+let snapshot = collectSnapshot(
+    mode: mode,
+    startedAt: startedAt,
+    includeConnectivity: mode == "turn_start"
+)
+
+if codexHook {
+    try printJSON(codexHookOutput(mode: mode, snapshot: snapshot, stopHookActive: stopHookActive))
+} else if outputJSON {
+    try printJSON(snapshot.jsonObject(), pretty: true)
 } else {
     print(renderText(snapshot))
 }

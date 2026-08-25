@@ -38,6 +38,9 @@ A few real things that happened for me:
 - Storage got stupid too. Every Parallax eval run had been saving garbage Codex
   did not clean up, and the worktrees were taking an absurd amount of space. I
   had about 1.9 TB used on a Mac I had only owned for a few weeks.
+- During a Babel run, two forgotten `computer_use` workers were still alive after
+  26-33 hours. One was using roughly two CPU cores and 9.5 GB of memory. macOS
+  still reported nominal thermals, and Codex did not investigate until I asked.
 
 This is not just my machine being weird. Theo talked about the same macOS process
 security-check problem on Nerd Snipe at
@@ -57,31 +60,34 @@ machine is under pressure. If the work can be done, they should still do it. The
 hook is just context: let the agent see the machine, avoid obvious waste, and
 clean up safe stuff it clearly owns when the work is done.
 
-The hook only reports facts. The agent decides what those facts mean, investigates
-more if needed, and only cleans up resources it can clearly tie to its own work.
+The collector reports facts and applies a small set of fixed attention rules. The
+agent still investigates the cause, decides what to do, and only cleans up
+resources it can clearly tie to its own work.
 
 ## How It Works
 
 The default collector is a native Swift CLI:
 
 ```text
-Codex hook
-  -> system-health-codex-hook.zsh
-  -> system-health-context
-  -> compact system snapshot
-  -> exits
+UserPromptSubmit -> system-health-context -> compact system snapshot -> exits
+Stop            -> system-health-context -> no-op or one investigation pass -> exits
 ```
 
 There is no daemon, no local server, no always-on monitor, and no automatic
 cleanup.
 
-The shell wrapper exists only to fit Codex's command-hook shape. The actual
-health collection is done by the native binary.
+New installs call the native binary directly. A small shell wrapper remains for
+older installations.
 
 The collector combines a 100 ms live sample with durable counters already kept
 by macOS. The live sample shows what is busy now. Process age, lifetime CPU,
 physical and peak memory, disk I/O, and wakeups keep long-running tooling visible
 even when the short sample lands during a quiet moment.
+
+At the end of a turn, Codex runs a smaller snapshot without the network probes.
+If a fixed rule finds strong evidence of pressure, the Stop hook continues the
+turn once and asks the agent to investigate. It never kills a process or deletes
+anything. The second Stop is always allowed, which prevents a loop.
 
 ## Safety Budget
 
@@ -110,12 +116,13 @@ The hook is intentionally boring:
 
 - read-only
 - fixed-shape
-- telemetry-only
 - local machine context
+- deterministic attention rules
 - no cleanup decisions
 - no process killing
 - no file deletion
-- no task blocking
+- no tool or user-request blocking
+- at most one end-of-turn continuation
 
 ## Output Shape
 
@@ -124,45 +131,52 @@ Default text output is a compact card:
 ```text
 System Health Context
 
-Treat this as operational context, not decoration.
+Use this snapshot as operational context.
 Do not refuse work solely because of system health.
-If a signal could affect the work, investigate before adding load and adapt.
+If Attention is required, investigate the listed facts before adding more load. Do not wait for the user to notice.
 Do not recite healthy values.
 Helpers listed may belong to other active sessions; own only what this session started.
 At turn end, clean up only safe, clearly-owned resources.
 Ask before destructive cleanup.
 
-Header: hook_version=0.4.0 mode=turn_start timestamp=... host=...
+Attention: none
+Header: hook_version=0.5.0 mode=turn_start timestamp=... host=...
 Storage: disk=10% free=1789G
 CPU: cores=18 busy=8.4% load=3.73/3.15/2.79 top=node_repl[5960]:166%/4h33m
 Security: syspolicyd=0.0% trustd=0.0% sandboxd=0.0%
 Memory: pressure=normal ram=68.7G free=9.0G inactive=31.7G compressed=3.8G wired=3.5G swap=0.4G top=node_repl[5960]:11.0G/peak=40.0G/4h33m
-Power: source=AC battery=100% charging=not_charging low_power=off thermal_pressure=nominal
+Power: source=AC battery=100% charging=not_charging low_power=off
+Thermals: sensor_avg=49.3C sensor_max=57.2C cpu_sensor_avg=57.2C cpu_sensor_max=57.2C gpu_sensor_avg=46.2C gpu_sensor_max=46.2C soc_sensor_avg=44.6C soc_sensor_max=44.6C fans=2:1459rpm/max=5777rpm macos_state=nominal
 Network: route=en0 rx=29KB/s tx=51KB/s gateway=192.168.1.1 gateway_tcp=3.3ms wan_tcp=7.8ms
 WiFi: interface=en0 associated=yes rssi=-53dBm noise=-96dBm channel=36 tx=1080Mbps
 Codex: hosts=13 helpers=18 (mcp=7 node_repl=5 computer_use=2 xcodebuildmcp=4) app_servers=2 oldest=(mcp=6h31m node_repl=5h28m computer_use=2h4m xcodebuildmcp=5h28m)
 CodexResources: cpu=node_repl[5960]:now=166%/avg=150%/age=4h33m memory=node_repl[5960]:11.0G/peak=40.0G io=node_repl[5960]:read_avg=1.2MB/s/total=20.0G/write_avg=123KB/s/total=2.0G
-Lifecycle: uptime=6h33m processes=484 zombies=0 orphaned_helpers=0
-BrowserAutomation: processes=12 profiles=1 orphaned=0 debug_ports=0
-Collection: 138ms
+Lifecycle: uptime=6h33m processes=484 zombies=0 parent_pid_1_helpers=0
+BrowserAutomation: processes=12 profiles=1 parent_pid_1=0 debug_ports=0
+Collection: 198ms
 ```
 
 `Network` follows the kernel's default route, including a VPN tunnel. `WiFi`
 still describes the physical wireless link, so the two lines can be different.
 
-`thermal_pressure=nominal` means macOS is not currently throttling the machine.
-It does not mean the laptop is cool. CPU use and process resource lines are what
-make a heat source visible before thermal throttling starts.
+`macos_state` is Apple's coarse thermal state. The temperatures and fan RPM are
+direct sensor readings. A nominal macOS state does not override those values or
+the process resource lines.
+
+On Apple Silicon, the collector first reads a small targeted set of AppleSMC
+sensors for CPU, GPU, SoC, and fan RPM. If those are unavailable, it falls back
+to the HID temperature hub. These interfaces are private and undocumented, so a
+missing reading is reported as `unavailable`, never guessed.
 
 The example values above are illustrative. The hook reports raw facts and leaves
 the investigation and response to the agent.
 
 ## Performance Budget
 
-The hook remains a single short-lived process. On the machine used to develop
-version 0.4, nine comparable runs had a median of 145 ms for the installed 0.3
-collector and 148 ms for the 0.4 release collector. The 100 ms live sample still
-accounts for most of that time.
+The hook remains a single short-lived process. On the M5 Pro used to develop
+version 0.5, release snapshots typically took roughly 200-260 ms. The 100 ms
+live sample still accounts for most of that time. Nothing runs between those two
+lifecycle events.
 
 Performance is part of correctness here. New default signals should use bounded
 native APIs, fit inside the existing sample window, and be benchmarked before
@@ -203,12 +217,12 @@ have hooks, it installs the files and prints the small config block to merge.
 
 Codex may ask you to review new or changed hooks. Review the path and trust it if
 it points to the hook you just installed. After that, the Hooks page should show
-an entry for `UserPromptSubmit`.
+entries for `UserPromptSubmit` and `Stop`.
 
 To check the installed hook directly:
 
 ```sh
-~/.codex/hooks/system-health-context/system-health-codex-hook.zsh turn_start
+~/.codex/hooks/system-health-context/system-health-context --codex-hook turn_start
 ```
 
 ## Manual Codex Config
@@ -218,11 +232,15 @@ Install the collector somewhere stable, then register it as a command hook:
 ```toml
 [hooks]
 UserPromptSubmit = [
-  { hooks = [ { type = "command", command = "/path/to/system-health-codex-hook.zsh turn_start", timeout = 5, statusMessage = "Collecting system health context" } ] }
+  { hooks = [ { type = "command", command = "/path/to/system-health-context --codex-hook turn_start", timeout = 5, statusMessage = "Collecting system health context" } ] }
+]
+Stop = [
+  { hooks = [ { type = "command", command = "/path/to/system-health-context --codex-hook turn_end", timeout = 5, statusMessage = "Checking end-of-turn system health" } ] }
 ]
 ```
 
-The wrapper exits successfully even when individual signals are unavailable.
+The binary emits developer-context JSON for `UserPromptSubmit` and valid control
+JSON for `Stop`. Individual sensor failures remain non-fatal.
 
 ## Development
 
@@ -243,8 +261,10 @@ Run:
 ```sh
 .build/debug/system-health-context turn_start
 .build/debug/system-health-context --json turn_start
+.build/debug/system-health-context --codex-hook turn_start
 ```
 
 ## License
 
-MIT
+MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the thermal sensor
+implementation's upstream notice.
