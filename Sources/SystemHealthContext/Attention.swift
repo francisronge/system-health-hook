@@ -49,7 +49,7 @@ struct AttentionAssessment {
 
     var line: String {
         guard required else { return "none" }
-        return "required " + reasons.map(\.summary).joined(separator: " | ")
+        return "flagged " + reasons.map(\.summary).joined(separator: " | ")
     }
 }
 
@@ -61,6 +61,7 @@ func assessAttention(
     security: SecurityStatus,
     thermals: ThermalSnapshot,
     processes: [ProcessSample],
+    physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory,
     now: TimeInterval = Date().timeIntervalSince1970
 ) -> AttentionAssessment {
     var reasons: [AttentionReason] = []
@@ -128,7 +129,7 @@ func assessAttention(
         ))
     }
 
-    if let processReason = highestProcessConcern(processes, now: now) {
+    if let processReason = processConcerns(processes, physicalMemoryBytes: physicalMemoryBytes, now: now) {
         reasons.append(processReason)
     }
 
@@ -145,14 +146,33 @@ private func formatTemperatureForReason(_ value: Double) -> String {
     String(format: "%.1fC", value)
 }
 
-private func highestProcessConcern(_ processes: [ProcessSample], now: TimeInterval) -> AttentionReason? {
-    processes.compactMap { processConcern($0, now: now) }.max {
-        if $0.severity != $1.severity { return $0.severity < $1.severity }
-        return $0.summary > $1.summary
+private func processConcerns(_ processes: [ProcessSample], physicalMemoryBytes: UInt64, now: TimeInterval) -> AttentionReason? {
+    let concerns = processes.compactMap { processConcern($0, physicalMemoryBytes: physicalMemoryBytes, now: now) }.sorted {
+        if $0.severity != $1.severity { return $0.severity > $1.severity }
+        return $0.summary < $1.summary
     }
+    if let first = concerns.first {
+        let remaining = concerns.count > 3 ? "; \(concerns.count - 3) more above thresholds" : ""
+        return AttentionReason(code: first.code,
+            summary: concerns.prefix(3).map(\.summary).joined(separator: "; ") + remaining,
+            severity: first.severity)
+    }
+    let helpers = processes.filter {
+        guard let kind = helperKind($0), kind != "app_server" else { return false }
+        return now - $0.startTime >= 60
+    }
+    let cpu = helpers.reduce(0) { $0 + $1.cpuPercent }
+    let memory = helpers.reduce(0.0) { $0 + Double($1.memoryBytes) }
+    guard cpu >= 100 || memory >= Double(max(2 * gigabyte, physicalMemoryBytes / 4)) else { return nil }
+    let leaders = helpers.sorted {
+        cpu >= 100 ? $0.cpuPercent > $1.cpuPercent : $0.memoryBytes > $1.memoryBytes
+    }.prefix(3).map { "\(processLabel($0)) cpu=\(formatPercent($0.cpuPercent)) memory=\(formatBytes($0.memoryBytes))" }
+    return AttentionReason(code: "helper_resource_pressure",
+        summary: "helpers total_cpu=\(formatPercent(cpu)) total_memory=\(formatGB(UInt64(memory))) leaders: \(leaders.joined(separator: "; "))",
+        severity: 88)
 }
 
-private func processConcern(_ process: ProcessSample, now: TimeInterval) -> AttentionReason? {
+private func processConcern(_ process: ProcessSample, physicalMemoryBytes: UInt64, now: TimeInterval) -> AttentionReason? {
     let kind = helperKind(process)
     let helper = kind != nil && kind != "app_server"
     let host = isCodexHostProcess(process)
@@ -162,17 +182,19 @@ private func processConcern(_ process: ProcessSample, now: TimeInterval) -> Atte
     let averageCPU = lifetimeAverageCPU(process, now: now)
     let writeRate = lifetimeAverageRate(bytes: process.diskWriteBytes, process: process, now: now)
     let wakeupRate = lifetimeWakeupRate(process, now: now)
-    let memoryThreshold = helper ? 4 * gigabyte : 8 * gigabyte
+    let memoryThreshold = helper
+        ? min(4 * gigabyte, max(gigabyte, physicalMemoryBytes / 8))
+        : min(8 * gigabyte, max(2 * gigabyte, physicalMemoryBytes / 4))
     let parentIsPID1 = helper && process.ppid == 1
 
     var severity = 0
-    if helper, age >= 10 * 60, process.cpuPercent >= 100 {
+    if helper, age >= 60, process.cpuPercent >= 100 {
         severity = max(severity, process.cpuPercent >= 200 ? 100 : 92)
     }
-    if age >= 30 * 60, averageCPU >= 50 {
+    if age >= 30 * 60, averageCPU >= 50, process.cpuPercent >= 25 {
         severity = max(severity, averageCPU >= 100 ? 98 : 90)
     }
-    if age >= 30 * 60, process.memoryBytes >= memoryThreshold {
+    if process.memoryBytes >= memoryThreshold {
         severity = max(severity, process.memoryBytes >= 8 * gigabyte ? 98 : 90)
     }
     if age >= 10 * 60, writeRate >= 20_000_000 {
@@ -185,6 +207,7 @@ private func processConcern(_ process: ProcessSample, now: TimeInterval) -> Atte
 
     var facts = [
         "age=\(formatAge(age))",
+        "ppid=\(process.ppid)",
         "cpu_now=\(formatPercent(process.cpuPercent))",
         "cpu_avg=\(formatPercent(averageCPU))",
         "memory=\(formatBytes(process.memoryBytes))"
