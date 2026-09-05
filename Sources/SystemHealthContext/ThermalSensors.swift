@@ -53,13 +53,14 @@ struct ThermalSnapshot {
             if fans.isEmpty {
                 parts.append("fans=none")
             } else {
-                let current = fans.map(\.currentRPM).max() ?? 0
-                let maximum = fans.compactMap(\.maximumRPM).max()
-                var value = "\(Int(current.rounded()))rpm"
-                if let maximum, maximum > 0 {
-                    value += "/max=\(Int(maximum.rounded()))rpm"
+                let values = fans.map { fan in
+                    var value = "\(Int(fan.currentRPM.rounded()))rpm"
+                    if let maximum = fan.maximumRPM, maximum > 0 {
+                        value += "/max=\(Int(maximum.rounded()))rpm"
+                    }
+                    return value
                 }
-                parts.append("fans=\(fans.count):\(value)")
+                parts.append("fans=\(fans.count):\(values.joined(separator: ","))")
             }
         } else {
             parts.append("fans=unavailable")
@@ -247,7 +248,7 @@ private func readSMCKey(_ connection: io_connect_t, _ key: String) -> (type: Str
             )
         }
     }
-    guard keyInfoResult == KERN_SUCCESS, output[40] == 0 else { return nil }
+    guard keyInfoResult == KERN_SUCCESS, outputSize >= 41, output[40] == 0 else { return nil }
 
     let dataSize = output.withUnsafeBytes {
         $0.loadUnaligned(fromByteOffset: 28, as: UInt32.self)
@@ -278,7 +279,7 @@ private func readSMCKey(_ connection: io_connect_t, _ key: String) -> (type: Str
             )
         }
     }
-    guard readResult == KERN_SUCCESS, output[40] == 0 else { return nil }
+    guard readResult == KERN_SUCCESS, outputSize >= 48 + readSize, output[40] == 0 else { return nil }
     return (unpackSMCType(dataType), Array(output[48..<(48 + readSize)]))
 }
 

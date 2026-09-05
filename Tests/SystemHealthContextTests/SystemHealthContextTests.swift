@@ -80,6 +80,91 @@ final class SystemHealthContextTests: XCTestCase {
         XCTAssertEqual(nanosecondsFromMachTicks(42, numerator: 1, denominator: 1), 42)
     }
 
+    func testCPUUsesEachProcessesActualMeasurementInterval() {
+        let before = CPUObservation(cpuNanos: 100_000_000, sampledAt: 1_000_000_000)
+        let after = CPUObservation(cpuNanos: 200_000_000, sampledAt: 1_200_000_000)
+        XCTAssertEqual(measuredCPU(previous: before, current: after), 50, accuracy: 0.001)
+        XCTAssertEqual(measuredCPU(previous: after, current: before), 0)
+        XCTAssertEqual(measuredCPU(previous: before, current: before), 0)
+        XCTAssertEqual(measuredCPU(previous: before,
+            current: CPUObservation(cpuNanos: 0, sampledAt: 1_200_000_000)), 0)
+    }
+
+    private func processAttention(_ processes: [ProcessSample], ram: UInt64 = 64_000_000_000) -> AttentionAssessment {
+        assessAttention(
+            storage: StorageStatus(usedPercent: 20, freeBytes: 500_000_000_000),
+            memory: MemoryStatus(pressure: .normal, detail: ""),
+            security: SecurityStatus(syspolicydCPU: 0, trustdCPU: 0, sandboxdCPU: 0),
+            thermals: ThermalSnapshot(readings: [], fans: nil, macOSState: "nominal"),
+            processes: processes, physicalMemoryBytes: ram, now: 2_000_000_000
+        )
+    }
+
+    func testRecentlyStartedBusyHelperDoesNotWaitTenMinutes() {
+        let process = sample(args: "node computer_use trusted-worker", age: 120,
+            cpuPercent: 180, now: 2_000_000_000)
+        XCTAssertTrue(processAttention([process]).required)
+    }
+
+    func testLargeMemoryFootprintDoesNotWaitThirtyMinutes() {
+        let process = sample(args: "node computer_use trusted-worker", age: 10,
+            memoryBytes: 4_000_000_000, now: 2_000_000_000)
+        XCTAssertTrue(processAttention([process]).required)
+    }
+
+    func testMemoryThresholdScalesToSmallMachines() {
+        let process = sample(args: "node /tools/node_repl/kernel.js", age: 120,
+            memoryBytes: 1_100_000_000, now: 2_000_000_000)
+        XCTAssertTrue(processAttention([process], ram: 8_000_000_000).required)
+        XCTAssertFalse(processAttention([process]).required)
+    }
+
+    func testMultipleHotHelpersRemainVisibleWithTheirParents() {
+        let processes = (1...4).map { index in
+            sample(pid: pid_t(index), ppid: pid_t(100 + index),
+                args: "node computer_use trusted-worker", age: 14 * 3600,
+                cpuPercent: 180, now: 2_000_000_000)
+        }
+        let assessment = processAttention(processes)
+        XCTAssertEqual(assessment.reasons.count, 1)
+        XCTAssertTrue(assessment.line.contains("computer_use[1]"))
+        XCTAssertTrue(assessment.line.contains("computer_use[2]"))
+        XCTAssertTrue(assessment.line.contains("computer_use[3]"))
+        XCTAssertTrue(assessment.line.contains("ppid=101"))
+        XCTAssertTrue(assessment.line.contains("1 more above thresholds"))
+    }
+
+    func testCombinedHelperCPUIsVisibleEvenBelowIndividualThresholds() {
+        let processes = (1...3).map { index in
+            sample(pid: pid_t(index), args: "node mcp-server", age: 120,
+                cpuPercent: 40, now: 2_000_000_000)
+        }
+        XCTAssertEqual(processAttention(processes).reasons.first?.code, "helper_resource_pressure")
+    }
+
+    func testCombinedHelperMemoryScalesToSmallMachines() {
+        let processes = (1...3).map { index in
+            sample(pid: pid_t(index), args: "node mcp-server", age: 120,
+                memoryBytes: 800_000_000, now: 2_000_000_000)
+        }
+        XCTAssertTrue(processAttention(processes, ram: 8_000_000_000).required)
+        XCTAssertFalse(processAttention(processes).required)
+    }
+
+    func testPastCPUAloneDoesNotFlagNowIdleHelpers() {
+        let process = sample(args: "node /tools/node_repl/kernel.js", age: 14 * 3600,
+            cpuPercent: 0, averageCPU: 150, now: 2_000_000_000)
+        XCTAssertFalse(processAttention([process]).required)
+    }
+
+    func testOldIdleHelpersDoNotTriggerFromCountsOrParentOne() {
+        let processes = (1...40).map { index in
+            sample(pid: pid_t(index), args: "node mcp-server", age: 14 * 3600,
+                now: 2_000_000_000)
+        }
+        XCTAssertFalse(processAttention(processes).required)
+    }
+
     func testProcessArgumentsStopBeforeEnvironment() {
         var argc: Int32 = 2
         var buffer: [UInt8] = []
@@ -292,6 +377,7 @@ final class SystemHealthContextTests: XCTestCase {
             security: SecurityStatus(syspolicydCPU: 0, trustdCPU: 0, sandboxdCPU: 0),
             thermals: ThermalSnapshot(readings: [], fans: nil, macOSState: "nominal"),
             processes: [healthy],
+            physicalMemoryBytes: 64_000_000_000,
             now: now
         )
 
@@ -315,6 +401,7 @@ final class SystemHealthContextTests: XCTestCase {
             security: SecurityStatus(syspolicydCPU: 0, trustdCPU: 0, sandboxdCPU: 0),
             thermals: ThermalSnapshot(readings: [], fans: nil, macOSState: "nominal"),
             processes: [launchdOwned],
+            physicalMemoryBytes: 64_000_000_000,
             now: now
         )
 
@@ -338,6 +425,7 @@ final class SystemHealthContextTests: XCTestCase {
             security: SecurityStatus(syspolicydCPU: 0, trustdCPU: 0, sandboxdCPU: 0),
             thermals: ThermalSnapshot(readings: [], fans: nil, macOSState: "nominal"),
             processes: [appServer],
+            physicalMemoryBytes: 64_000_000_000,
             now: now
         )
 
@@ -492,6 +580,15 @@ final class SystemHealthContextTests: XCTestCase {
         XCTAssertTrue(unavailable.line.contains("fans=unavailable"))
     }
 
+    func testFanReadingsKeepEachCurrentAndMaximumPaired() {
+        let thermals = ThermalSnapshot(readings: [], fans: [
+            FanReading(currentRPM: 4_800, maximumRPM: 5_000),
+            FanReading(currentRPM: 2_000, maximumRPM: 6_000)
+        ], macOSState: "nominal")
+        XCTAssertTrue(thermals.line.contains("fans=2:4800rpm/max=5000rpm,2000rpm/max=6000rpm"))
+        XCTAssertFalse(thermals.line.contains("4800rpm/max=6000rpm"))
+    }
+
     func testTextOmitsUnavailableConnectivityWithoutBlankLines() {
         let value = snapshot(attention: AttentionAssessment(reasons: []))
         let text = renderText(value)
@@ -517,7 +614,7 @@ final class SystemHealthContextTests: XCTestCase {
         XCTAssertTrue(text.contains("Thermals: sensor_max=45.0C macos_state=nominal\nNetwork: route=en0\nWiFi: interface=en0\nCodex:"))
     }
 
-    func testStopContinuesOnlyOnceWhenAttentionIsRequired() {
+    func testStopOnlyNotifiesWhenAttentionIsFlagged() {
         let assessment = AttentionAssessment(reasons: [
             AttentionReason(code: "memory_pressure", summary: "memory pressure is critical", severity: 100)
         ])
@@ -526,14 +623,32 @@ final class SystemHealthContextTests: XCTestCase {
         let firstStop = codexHookOutput(mode: "turn_end", snapshot: snapshot, stopHookActive: false)
         let repeatedStop = codexHookOutput(mode: "turn_end", snapshot: snapshot, stopHookActive: true)
 
-        XCTAssertEqual(firstStop["decision"] as? String, "block")
-        let reason = firstStop["reason"] as? String
-        XCTAssertTrue(reason?.hasPrefix("Continue the current task.") == true)
-        XCTAssertTrue(reason?.contains("memory pressure is critical") == true)
-        XCTAssertTrue(reason?.contains("Then finish the original request.") == true)
-        XCTAssertTrue(reason?.contains("Do not replace the requested result with a system-health report.") == true)
+        XCTAssertNil(firstStop["decision"])
+        XCTAssertNil(firstStop["continue"])
+        XCTAssertNil(firstStop["reason"])
+        let notice = firstStop["systemMessage"] as? String
+        XCTAssertTrue(notice?.hasPrefix("System health:") == true)
+        XCTAssertTrue(notice?.contains("memory pressure is critical") == true)
         XCTAssertTrue(repeatedStop.isEmpty)
-        XCTAssertEqual(Set(firstStop.keys), ["decision", "reason"])
+        XCTAssertEqual(Set(firstStop.keys), ["systemMessage"])
+    }
+
+    func testStartKeepsTaskPrimaryAndCleanupInTheTask() {
+        let assessment = AttentionAssessment(reasons: [
+            AttentionReason(code: "thermal_pressure", summary: "sensor=101C", severity: 100)
+        ])
+        let output = codexHookOutput(mode: "turn_start", snapshot: snapshot(attention: assessment))
+        XCTAssertEqual(Set(output.keys), ["hookSpecificOutput"])
+        let specific = output["hookSpecificOutput"] as? [String: String]
+        XCTAssertEqual(specific?["hookEventName"], "UserPromptSubmit")
+        let text = specific?["additionalContext"] ?? ""
+        XCTAssertTrue(text.contains("Keep the user's task primary."))
+        XCTAssertTrue(text.contains("advisory"))
+        XCTAssertTrue(text.contains("including helpers it reused"))
+        XCTAssertTrue(text.contains("verify cleanup"))
+        XCTAssertTrue(text.contains("Protect active or shared resources"))
+        XCTAssertTrue(text.contains("Attention: flagged"))
+        XCTAssertFalse(text.contains("investigate before adding load"))
     }
 
     func testStopHookActiveInputDecoding() {
@@ -592,5 +707,9 @@ final class SystemHealthContextTests: XCTestCase {
         )
 
         XCTAssertEqual(assessment.reasons.count, 3)
+        let stop = codexHookOutput(mode: "turn_end", snapshot: snapshot(attention: assessment))
+        XCTAssertEqual(Set(stop.keys), ["systemMessage"])
+        XCTAssertNil(stop["decision"])
+        XCTAssertNil(stop["continue"])
     }
 }

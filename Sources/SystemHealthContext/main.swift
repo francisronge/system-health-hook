@@ -4,7 +4,7 @@ import Foundation
 import IOKit.ps
 import SystemConfiguration
 
-func currentHookVersion() -> String { "0.5.0" }
+func currentHookVersion() -> String { "0.6.1" }
 
 let machTimebase: mach_timebase_info_data_t = {
     var info = mach_timebase_info_data_t()
@@ -44,9 +44,31 @@ struct ProcessSample {
     let startTime: TimeInterval
     let status: Int32
     var cpuPercent: Double = 0
+    var sampledAt: UInt64 = 0
+    let searchText: String
+    let helperType: String?
 
-    var searchText: String {
-        "\(name) \(path) \(args)".lowercased()
+    init(pid: pid_t, ppid: pid_t, name: String, path: String, args: String,
+         residentBytes: UInt64, physicalFootprintBytes: UInt64, peakPhysicalFootprintBytes: UInt64,
+         cpuNanos: UInt64, lifetimeCpuNanos: UInt64, diskReadBytes: UInt64,
+         diskWriteBytes: UInt64, idleWakeups: UInt64, startTime: TimeInterval, status: Int32) {
+        self.pid = pid
+        self.ppid = ppid
+        self.name = name
+        self.path = path
+        self.args = args
+        self.residentBytes = residentBytes
+        self.physicalFootprintBytes = physicalFootprintBytes
+        self.peakPhysicalFootprintBytes = peakPhysicalFootprintBytes
+        self.cpuNanos = cpuNanos
+        self.lifetimeCpuNanos = lifetimeCpuNanos
+        self.diskReadBytes = diskReadBytes
+        self.diskWriteBytes = diskWriteBytes
+        self.idleWakeups = idleWakeups
+        self.startTime = startTime
+        self.status = status
+        self.searchText = "\(name) \(path) \(args)".lowercased()
+        self.helperType = classifyHelper(identity: "\(name) \(path)", arguments: args)
     }
 
     var memoryBytes: UInt64 {
@@ -106,7 +128,7 @@ struct Snapshot {
     let lifecycle: String
     let browserAutomation: String
     let attention: AttentionAssessment
-    let collection: String
+    var collection: String
 
     func jsonObject() -> [String: Any] {
         var object: [String: Any] = [
@@ -303,7 +325,7 @@ func parsedProcessArguments(_ buffer: [UInt8]) -> [String] {
 func processArguments(pid: pid_t) -> String {
     var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
     var size = 0
-    if sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) != 0 || size <= 0 {
+    if sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) != 0 || size <= 0 || size > 1_048_576 {
         return ""
     }
 
@@ -438,12 +460,22 @@ func listedProcessIDs() -> [pid_t] {
     return Array(pids.prefix(count).filter { $0 > 0 })
 }
 
-func collectCPUTimes() -> [pid_t: UInt64] {
-    var times: [pid_t: UInt64] = [:]
+struct CPUObservation {
+    let cpuNanos: UInt64
+    let sampledAt: UInt64
+}
+
+func measuredCPU(previous: CPUObservation, current: CPUObservation) -> Double {
+    guard current.sampledAt > previous.sampledAt, current.cpuNanos >= previous.cpuNanos else { return 0 }
+    return Double(current.cpuNanos - previous.cpuNanos) / Double(current.sampledAt - previous.sampledAt) * 100
+}
+
+func collectCPUTimes() -> [pid_t: CPUObservation] {
+    var times: [pid_t: CPUObservation] = [:]
     for pid in listedProcessIDs() {
         guard let task = taskInfo(pid: pid) else { continue }
         let ticks = UInt64(task.pti_total_user) + UInt64(task.pti_total_system)
-        times[pid] = nanosecondsFromMachTicks(ticks)
+        times[pid] = CPUObservation(cpuNanos: nanosecondsFromMachTicks(ticks), sampledAt: DispatchTime.now().uptimeNanoseconds)
     }
     return times
 }
@@ -465,6 +497,7 @@ func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> Pro
             continue
         }
         guard let task = taskInfo(pid: pid) else { continue }
+        let sampledAt = DispatchTime.now().uptimeNanoseconds
         let bsdName = stringFromCCharTuple(bsd.pbi_name)
         let name = bsdName.isEmpty ? processName(pid: pid) : bsdName
         let path = processPath(pid: pid)
@@ -476,7 +509,7 @@ func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> Pro
         let usageCPUTicks = usage.map { $0.ri_user_time + $0.ri_system_time } ?? 0
         let taskCPUNanos = nanosecondsFromMachTicks(taskCPUTicks)
         let usageCPUNanos = nanosecondsFromMachTicks(usageCPUTicks)
-        samples.append(ProcessSample(
+        var sample = ProcessSample(
             pid: pid,
             ppid: pid_t(bitPattern: bsd.pbi_ppid),
             name: name,
@@ -490,9 +523,11 @@ func collectProcesses(includeArguments: Bool, includeDetailedUsage: Bool) -> Pro
             diskReadBytes: usage?.ri_diskio_bytesread ?? 0,
             diskWriteBytes: usage?.ri_diskio_byteswritten ?? 0,
             idleWakeups: usage.map { $0.ri_pkg_idle_wkups + $0.ri_interrupt_wkups } ?? 0,
-            startTime: TimeInterval(bsd.pbi_start_tvsec),
+            startTime: TimeInterval(bsd.pbi_start_tvsec) + Double(bsd.pbi_start_tvusec) / 1_000_000,
             status: status
-        ))
+        )
+        sample.sampledAt = sampledAt
+        samples.append(sample)
     }
 
     return ProcessCollection(samples: samples, processCount: processCount, zombieCount: zombieCount)
@@ -528,7 +563,8 @@ func interfaceCounters() -> [String: InterfaceCounters] {
     var pointer: UnsafeMutablePointer<ifaddrs>? = first
     while let current = pointer {
         defer { pointer = current.pointee.ifa_next }
-        guard let data = current.pointee.ifa_data?.assumingMemoryBound(to: if_data.self) else {
+        guard current.pointee.ifa_addr?.pointee.sa_family == UInt8(AF_LINK),
+              let data = current.pointee.ifa_data?.assumingMemoryBound(to: if_data.self) else {
             continue
         }
         let name = String(cString: current.pointee.ifa_name)
@@ -540,10 +576,10 @@ func interfaceCounters() -> [String: InterfaceCounters] {
     return counters
 }
 
-func sampledProcesses(whileWaiting: (() -> Void)? = nil) -> ProcessSnapshot {
+func sampledProcesses(includeConnectivity: Bool = true, whileWaiting: (() -> Void)? = nil) -> ProcessSnapshot {
     let sampleStartedAt = DispatchTime.now().uptimeNanoseconds
     let beforeCPUTicks = cpuTicks()
-    let beforeInterfaces = interfaceCounters()
+    let beforeInterfaces = includeConnectivity ? interfaceCounters() : [:]
     let beforeCPU = collectCPUTimes()
     whileWaiting?()
     let workElapsed = Double(DispatchTime.now().uptimeNanoseconds - sampleStartedAt) / 1_000_000_000
@@ -552,15 +588,17 @@ func sampledProcesses(whileWaiting: (() -> Void)? = nil) -> ProcessSnapshot {
     }
     let secondSampleStartedAt = DispatchTime.now().uptimeNanoseconds
     let afterCPUTicks = cpuTicks()
-    let afterInterfaces = interfaceCounters()
+    let afterInterfaces = includeConnectivity ? interfaceCounters() : [:]
     let after = collectProcesses(includeArguments: true, includeDetailedUsage: true)
     let elapsedNanos = max(Double(secondSampleStartedAt - sampleStartedAt), 1)
     let elapsedSeconds = elapsedNanos / 1_000_000_000
 
     let processes = after.samples.map { sample in
         var updated = sample
-        if let previous = beforeCPU[sample.pid], sample.cpuNanos >= previous {
-            updated.cpuPercent = Double(sample.cpuNanos - previous) / elapsedNanos * 100
+        if let previous = beforeCPU[sample.pid] {
+            updated.cpuPercent = measuredCPU(previous: previous, current: CPUObservation(
+                cpuNanos: sample.cpuNanos, sampledAt: sample.sampledAt
+            ))
         }
         return updated
     }
@@ -599,7 +637,11 @@ func sampledProcesses(whileWaiting: (() -> Void)? = nil) -> ProcessSnapshot {
 }
 
 func helperKind(_ process: ProcessSample) -> String? {
-    let text = process.searchText
+    process.helperType
+}
+
+func classifyHelper(identity: String, arguments: String) -> String? {
+    let text = "\(identity) \(arguments)".lowercased()
     if text.contains("codex app-server") || text.contains("/codex app-server") { return "app_server" }
     if text.contains("node_repl") { return "node_repl" }
     if text.contains("xcodebuildmcp") { return "xcodebuildmcp" }
@@ -610,7 +652,7 @@ func helperKind(_ process: ProcessSample) -> String? {
         return "computer_use"
     }
     if text.contains("mcp") && (text.contains("codex") || text.contains("node")) { return "mcp" }
-    if isBrowserAutomationProcess(process) {
+    if isBrowserAutomationIdentity(identity: identity, arguments: arguments) {
         return "browser_automation"
     }
     return nil
@@ -677,12 +719,12 @@ func securityStatus(_ processes: [ProcessSample]) -> SecurityStatus {
     var sandboxd = 0.0
 
     for process in processes {
-        let text = "\(process.name) \(process.path)".lowercased()
-        if text.contains("syspolicyd") {
+        let name = process.path.isEmpty ? process.name : (process.path as NSString).lastPathComponent
+        if name == "syspolicyd" {
             syspolicyd += process.cpuPercent
-        } else if text.contains("sandboxd") {
+        } else if name == "sandboxd" {
             sandboxd += process.cpuPercent
-        } else if text.contains("trustd") {
+        } else if name == "trustd" {
             trustd += process.cpuPercent
         }
     }
@@ -1182,13 +1224,11 @@ func renderText(_ snapshot: Snapshot) -> String {
     var lines = [
         "System Health Context",
         "",
-        "Use this snapshot as operational context.",
-        "Do not refuse work solely because of system health.",
-        "If Attention is required, investigate the listed facts before adding more load. Do not wait for the user to notice.",
-        "Do not recite healthy values.",
-        "Helpers listed may belong to other active sessions; own only what this session started.",
-        "At turn end, clean up only safe, clearly-owned resources.",
-        "Ask before destructive cleanup.",
+        "Keep the user's task primary. These readings are advisory, not a reason by themselves to refuse, delay, reduce scope, or start a separate health investigation.",
+        "Use the available capacity when planning resource-heavy work. Avoid unnecessary copies and unbounded process spawning; preserve the requested result.",
+        "When readings suggest a relevant risk or wasted resources, make a brief targeted check as part of the work. High usage or an old PID alone does not prove a runaway. No broad audits or polling loops.",
+        "Before finishing, clean up verified unneeded resources from this task, including helpers it reused. Prefer closing or resetting through the owning tool, and verify cleanup. Protect active or shared resources; establish ownership before stopping processes or deleting files.",
+        "Briefly mention material risks or verified cleanup without replacing the requested result. Keep healthy readings out of the reply.",
         "",
         "Attention: \(snapshot.attention.line)",
         "Header: hook_version=\(currentHookVersion()) mode=\(snapshot.mode) timestamp=\(snapshot.timestamp) host=\(snapshot.host)",
@@ -1213,7 +1253,7 @@ func renderText(_ snapshot: Snapshot) -> String {
 
 func collectSnapshot(mode: String, startedAt: UInt64, includeConnectivity: Bool = true) -> Snapshot {
     var thermals = ThermalSnapshot(readings: [], fans: nil, macOSState: macOSThermalState())
-    let sampled = sampledProcesses {
+    let sampled = sampledProcesses(includeConnectivity: includeConnectivity) {
         thermals = collectThermalSnapshot()
     }
     let processes = sampled.processes
@@ -1230,9 +1270,7 @@ func collectSnapshot(mode: String, startedAt: UInt64, includeConnectivity: Bool 
     let wifi = includeConnectivity ? wifiLineAndInterface() : (line: "", interface: nil)
     let route = includeConnectivity ? kernelDefaultRoute() : nil
     let network = includeConnectivity ? networkLine(route: route, rates: sampled.interfaceRates) : ""
-    let durationMillis = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
-
-    return Snapshot(
+    var snapshot = Snapshot(
         mode: mode,
         timestamp: isoTimestamp(),
         host: hostname(),
@@ -1253,8 +1291,11 @@ func collectSnapshot(mode: String, startedAt: UInt64, includeConnectivity: Bool 
         ),
         browserAutomation: browserAutomationLine(processes),
         attention: attention,
-        collection: String(format: "%.0fms", durationMillis)
+        collection: ""
     )
+    let durationMillis = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+    snapshot.collection = String(format: "%.0fms", durationMillis)
+    return snapshot
 }
 
 struct CodexStopHookInput: Decodable {
@@ -1278,19 +1319,11 @@ func decodeStopHookActive(_ data: Data) -> Bool {
     return decoded.stopHookActive
 }
 
-func stopContinuationReason(_ assessment: AttentionAssessment) -> String {
-    let facts = assessment.reasons.map(\.summary).joined(separator: "; ")
-    return """
-    Continue the current task. Before finishing, investigate only the listed health signal far enough to decide whether this work is causing it: \(facts). Adapt the work or clean up safe, clearly-owned leftovers from this task if needed. Then finish the original request. Do not replace the requested result with a system-health report. Mention system health only if it affected the work or requires user action. Do not terminate resources that may belong to another active task.
-    """
-}
-
 func codexHookOutput(mode: String, snapshot: Snapshot, stopHookActive: Bool = false) -> [String: Any] {
     if mode == "turn_end" {
         guard snapshot.attention.required, !stopHookActive else { return [:] }
         return [
-            "decision": "block",
-            "reason": stopContinuationReason(snapshot.attention)
+            "systemMessage": "System health: \(snapshot.attention.reasons.map(\.summary).joined(separator: "; ")). These readings alone do not establish a problem or prove a process is stale."
         ]
     }
     return [

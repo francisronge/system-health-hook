@@ -70,7 +70,7 @@ The default collector is a native Swift CLI:
 
 ```text
 UserPromptSubmit -> system-health-context -> compact system snapshot -> exits
-Stop            -> system-health-context -> no-op or one investigation pass -> exits
+Stop            -> system-health-context -> quiet or a UI warning -> exits
 ```
 
 There is no daemon, no local server, no always-on monitor, and no automatic
@@ -85,9 +85,17 @@ physical and peak memory, disk I/O, and wakeups keep long-running tooling visibl
 even when the short sample lands during a quiet moment.
 
 At the end of a turn, Codex runs a smaller snapshot without the network probes.
-If a fixed rule finds strong evidence of pressure, the Stop hook continues the
-turn once and asks the agent to investigate. It never kills a process or deletes
-anything. The second Stop is always allowed, which prevents a loop.
+If a fixed rule flags resource use, Stop emits a UI warning. Otherwise it stays
+quiet. It never restarts the agent, blocks a tool, kills a process, or deletes a
+file. The warning does not create a cleanup turn.
+
+The start-of-turn guidance asks the agent to account for available capacity and
+clean up verified leftovers as part of the work, including helpers it reused.
+It should check ownership and protect active or shared resources.
+
+The hook does not run between those events. Cleanup and any targeted checks
+depend on the agent following instructions. It cannot guarantee cleanup, prevent
+every runaway, or have zero cost. Legitimate heavy work can also trigger a warning.
 
 ## Safety Budget
 
@@ -122,7 +130,7 @@ The hook is intentionally boring:
 - no process killing
 - no file deletion
 - no tool or user-request blocking
-- at most one end-of-turn continuation
+- no end-of-turn continuation
 
 ## Output Shape
 
@@ -131,22 +139,20 @@ Default text output is a compact card:
 ```text
 System Health Context
 
-Use this snapshot as operational context.
-Do not refuse work solely because of system health.
-If Attention is required, investigate the listed facts before adding more load. Do not wait for the user to notice.
-Do not recite healthy values.
-Helpers listed may belong to other active sessions; own only what this session started.
-At turn end, clean up only safe, clearly-owned resources.
-Ask before destructive cleanup.
+Keep the user's task primary. These readings are advisory, not a reason by themselves to refuse, delay, reduce scope, or start a separate health investigation.
+Use the available capacity when planning resource-heavy work. Avoid unnecessary copies and unbounded process spawning; preserve the requested result.
+When readings suggest a relevant risk or wasted resources, make a brief targeted check as part of the work. High usage or an old PID alone does not prove a runaway. No broad audits or polling loops.
+Before finishing, clean up verified unneeded resources from this task, including helpers it reused. Prefer closing or resetting through the owning tool, and verify cleanup. Protect active or shared resources; establish ownership before stopping processes or deleting files.
+Briefly mention material risks or verified cleanup without replacing the requested result. Keep healthy readings out of the reply.
 
-Attention: none
-Header: hook_version=0.5.0 mode=turn_start timestamp=... host=...
+Attention: flagged node_repl[5960] age=4h33m ppid=5900 cpu_now=166% cpu_avg=150% memory=11.0G
+Header: hook_version=0.6.1 mode=turn_start timestamp=... host=...
 Storage: disk=10% free=1789G
 CPU: cores=18 busy=8.4% load=3.73/3.15/2.79 top=node_repl[5960]:166%/4h33m
 Security: syspolicyd=0.0% trustd=0.0% sandboxd=0.0%
 Memory: pressure=normal ram=68.7G free=9.0G inactive=31.7G compressed=3.8G wired=3.5G swap=0.4G top=node_repl[5960]:11.0G/peak=40.0G/4h33m
 Power: source=AC battery=100% charging=not_charging low_power=off
-Thermals: sensor_avg=49.3C sensor_max=57.2C cpu_sensor_avg=57.2C cpu_sensor_max=57.2C gpu_sensor_avg=46.2C gpu_sensor_max=46.2C soc_sensor_avg=44.6C soc_sensor_max=44.6C fans=2:1459rpm/max=5777rpm macos_state=nominal
+Thermals: sensor_avg=49.3C sensor_max=57.2C cpu_sensor_avg=57.2C cpu_sensor_max=57.2C gpu_sensor_avg=46.2C gpu_sensor_max=46.2C soc_sensor_avg=44.6C soc_sensor_max=44.6C fans=2:1350rpm/max=5349rpm,1459rpm/max=5777rpm macos_state=nominal
 Network: route=en0 rx=29KB/s tx=51KB/s gateway=192.168.1.1 gateway_tcp=3.3ms wan_tcp=7.8ms
 WiFi: interface=en0 associated=yes rssi=-53dBm noise=-96dBm channel=36 tx=1080Mbps
 Codex: hosts=13 helpers=18 (mcp=7 node_repl=5 computer_use=2 xcodebuildmcp=4) app_servers=2 oldest=(mcp=6h31m node_repl=5h28m computer_use=2h4m xcodebuildmcp=5h28m)
@@ -173,10 +179,15 @@ the investigation and response to the agent.
 
 ## Performance Budget
 
-The hook remains a single short-lived process. On the M5 Pro used to develop
-version 0.5, release snapshots typically took roughly 200-260 ms. The 100 ms
-live sample still accounts for most of that time. Nothing runs between those two
-lifecycle events.
+The hook remains a single short-lived process. In three interleaved end-of-turn
+release runs per version on the development M5 Pro, version 0.6 used a median
+104 ms of CPU time and finished in 211 ms, compared with 178 ms CPU and 283 ms
+elapsed for version 0.5. These are local measurements, not a guarantee for every
+machine. The collector still waits for a 100 ms live sample.
+
+`Collection` now includes building the snapshot's text fields. Earlier versions
+stopped that timer too soon, so compare total elapsed and CPU time when measuring
+changes. Nothing stays running between hook calls.
 
 Performance is part of correctness here. New default signals should use bounded
 native APIs, fit inside the existing sample window, and be benchmarked before
@@ -191,6 +202,9 @@ JSON is available for tests and integrations:
 ## Install For Codex
 
 Clone the repo, then run the installer:
+
+Requires Xcode Command Line Tools (Swift 6+) and Python 3.11+ for installation.
+Python is not used when the hook runs.
 
 ```sh
 git clone https://github.com/francisronge/system-health-hook.git
@@ -211,9 +225,14 @@ system-health-context           native collector
 system-health-codex-hook.zsh    Codex wrapper
 ```
 
-If `~/.codex/config.toml` does not already have a `[hooks]` section, the installer
-adds the Codex config for you and creates a timestamped backup. If you already
-have hooks, it installs the files and prints the small config block to merge.
+The installer registers both events in `~/.codex/config.toml`, repairs older
+registrations for this hook, and preserves other hooks and settings. It creates
+a private backup before changing the config. If it cannot safely preserve the
+config, it stops with an error. It then checks both registrations, compares the
+installed binary with the build, and prints its version.
+
+Rerun the installer after updating the repo. Pulling new code does not update the
+installed copy by itself.
 
 Codex may ask you to review new or changed hooks. Review the path and trust it if
 it points to the hook you just installed. After that, the Hooks page should show
@@ -223,6 +242,7 @@ To check the installed hook directly:
 
 ```sh
 ~/.codex/hooks/system-health-context/system-health-context --codex-hook turn_start
+python3 scripts/configure-codex-hook.py ~/.codex/config.toml ~/.codex/hooks/system-health-context/system-health-context --check
 ```
 
 ## Manual Codex Config
@@ -239,8 +259,9 @@ Stop = [
 ]
 ```
 
-The binary emits developer-context JSON for `UserPromptSubmit` and valid control
-JSON for `Stop`. Individual sensor failures remain non-fatal.
+The binary emits developer-context JSON for `UserPromptSubmit` and
+notification JSON for `Stop`. It never emits a blocking decision. Individual
+sensor failures remain non-fatal.
 
 ## Development
 
@@ -254,6 +275,7 @@ Test with compiler warnings treated as errors:
 
 ```sh
 swift test -Xswiftc -warnings-as-errors
+python3 -B -m unittest discover -s Tests -p 'test_*.py'
 ```
 
 Run:

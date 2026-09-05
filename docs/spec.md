@@ -2,8 +2,8 @@
 
 ## Purpose
 
-Give an agent cheap local machine context before each turn and require one
-bounded investigation before finishing when strong system pressure is visible.
+Give an agent cheap local machine context before each turn and flag resource use
+without requiring a separate investigation or another turn.
 
 The hook reports what the machine looks like and evaluates fixed attention
 rules. It does not decide what system action to take.
@@ -51,13 +51,15 @@ integrations.
 
 For Codex, install `--codex-hook turn_start` on `UserPromptSubmit` and
 `--codex-hook turn_end` on `Stop`. The first emits additional developer context.
-The second emits `{}` unless attention is required, in which case it emits one
-`decision: block` continuation. If `stop_hook_active` is true, it always emits
-`{}` to prevent repeated continuation.
+The second emits `{}` unless attention is flagged, in which case it emits only
+`systemMessage`, a UI warning. Neither path emits `decision`, `reason`, or
+`continue`. If `stop_hook_active` is true, it returns `{}` before collecting,
+avoiding another warning if another hook continued the turn.
 
-The continuation must preserve the original task: investigate only as far as
-needed, adapt or clean up safe resources owned by that task, and then finish the
-original request. It must not replace the requested result with a health report.
+Stop does not resume the agent or deliver a cleanup instruction for execution.
+Cleanup is part of the start-of-turn guidance. The agent should preserve the
+requested result and use targeted checks when relevant, not make health a
+prerequisite for ordinary work. This advisory design cannot guarantee compliance.
 
 ## Probe Budget
 
@@ -90,13 +92,11 @@ The hook output begins with this agent-facing text:
 ```text
 System Health Context
 
-Use this snapshot as operational context.
-Do not refuse work solely because of system health.
-If Attention is required, investigate the listed facts before adding more load. Do not wait for the user to notice.
-Do not recite healthy values.
-Helpers listed may belong to other active sessions; own only what this session started.
-At turn end, clean up only safe, clearly-owned resources.
-Ask before destructive cleanup.
+Keep the user's task primary. These readings are advisory, not a reason by themselves to refuse, delay, reduce scope, or start a separate health investigation.
+Use the available capacity when planning resource-heavy work. Avoid unnecessary copies and unbounded process spawning; preserve the requested result.
+When readings suggest a relevant risk or wasted resources, make a brief targeted check as part of the work. High usage or an old PID alone does not prove a runaway. No broad audits or polling loops.
+Before finishing, clean up verified unneeded resources from this task, including helpers it reused. Prefer closing or resetting through the owning tool, and verify cleanup. Protect active or shared resources; establish ownership before stopping processes or deleting files.
+Briefly mention material risks or verified cleanup without replacing the requested result. Keep healthy readings out of the reply.
 ```
 
 ## Compact Domains
@@ -158,9 +158,21 @@ Current high-confidence triggers:
 - serious or critical macOS thermal state
 - fan at least 85% of a known maximum, or at least 5000 RPM
 - `syspolicyd`, `trustd`, and `sandboxd` using at least 50% CPU in total
-- a recognized tool helper using at least one full core in the current sample
-- a recognized Codex/tool process with high lifetime-average CPU, large current
-  memory, sustained writes, or excessive wakeups
+- a recognized tool helper at least one minute old using one full core now
+- a recognized Codex/tool process at least 30 minutes old with lifetime-average
+  CPU at least 50% and current CPU at least 25%
+- a helper footprint at least one eighth of RAM (threshold bounded to 1-4 GB),
+  or a Codex host footprint at least one quarter of RAM (bounded to 2-8 GB),
+  without an age gate
+- recognized Codex/tool processes at least ten minutes old averaging at least
+  20 MB/s of lifetime writes or 1000 wakeups/s
+- when no individual process crosses a threshold, helpers at least one minute
+  old collectively using a core or a quarter of RAM (minimum 2 GB)
+
+The process reason includes up to three processes, their PIDs and parent PIDs,
+and a count of any additional matches. Collective pressure shows up to three
+leading helpers. These thresholds flag readings, not mandatory action. Lifetime
+averages do not establish that writes or wakeups are still happening now.
 
 Age, helper count, historical peak memory, or `ppid == 1` alone must not trigger
 attention. PID 1 can mean launchd-owned, so the output reports it only as
@@ -176,6 +188,11 @@ daemon, subprocess fan-out, unbounded enumeration, or repeated deep probes.
 because current CPU use is part of the attention decision.
 When Codex sets `stop_hook_active`, the binary returns `{}` before collecting a
 second snapshot.
+
+Each process's CPU delta uses its own monotonic measurement interval. Process
+classification is computed once per snapshot and reused. The collector does not
+keep history on disk or run between events. Mid-turn rechecks are an instruction
+to the agent, not a guaranteed automatic callback.
 
 ## Privacy
 
